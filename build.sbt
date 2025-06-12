@@ -32,6 +32,12 @@ version := "3.3.0"
 
 scalaVersion := "2.12.10"
 
+// 添加JVM内存配置
+javaOptions ++= Seq(
+  "-Xmx64G",  // 最大堆内存4GB
+  "-Xms16G"   // 初始堆内存2GB
+) 
+
 crossScalaVersions := Seq("2.12.10", "2.11.12")
 
 resolvers ++= Seq(

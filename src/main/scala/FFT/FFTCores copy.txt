@@ -1,0 +1,390 @@
+package FFT
+
+import chisel3._
+import chisel3.experimental._
+import chisel3.util._
+import scala.math._
+
+// FFT算法核心的通用IO
+class FFTCoreIO extends Bundle with HasDataConfig with HasElaborateConfig {
+  val mode = if(supportIFFT) Some(Input(Bool())) else None
+  val dIn = Input(new MyComplex)
+  val din_valid = Input(Bool())
+  val dOut1 = Output(new MyComplex)
+  val dOut2 = Output(new MyComplex)
+  val dout_valid = Output(Bool())
+  val busy = Output(Bool())
+}
+
+// R2MDC算法核心模块 - 原有实现
+class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
+  val io = IO(new FFTCoreIO)
+  
+  val mode = io.mode.getOrElse(false.B)
+  val stages = log2Ceil(FFTLength)
+  
+  def sinTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def sinTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def wnTable(k: Int)(idx: UInt): MyComplex = {
+    val res = Wire(new MyComplex)
+    res.re := Mux(mode, cosTable2(k)(idx), cosTable(k)(idx))
+    res.im := Mux(mode, sinTable2(k)(idx), sinTable(k)(idx))
+    res
+  }
+  
+  def timesInvn(a: MyComplex): MyComplex = {
+    val b = Wire(new MyComplex)
+    b.re := a.re >> stages
+    b.im := a.im >> stages
+    b
+  }
+  
+  val cnt = RegInit(0.U((stages + 1).W))
+  val busy = cnt =/= 0.U
+  when(io.din_valid || busy){
+    cnt := Mux(cnt === (FFTLength * 3 / 2 - 1).asUInt(), 0.U, cnt + 1.U)
+  }
+  io.busy := busy
+  
+  val out1 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  val out2 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  out1(0) := io.dIn
+  out2(0) := io.dIn
+  
+  for (i <- 0 until stages - 1) {
+    val wnCtrl = cnt(stages-2-i, 0)
+    val wn = wnTable(i)(wnCtrl)
+    val BF12 = Butterfly(ShiftRegister(out1(i), (FFTLength / pow(2, i + 1)).toInt), out2(i), wn)
+    val swCtrl = cnt(stages-2-i)
+    val sw12 = Switch(BF12._1, ShiftRegister(BF12._2, (FFTLength / pow(2, i + 2)).toInt), swCtrl)
+    out1(i + 1) := sw12._1
+    out2(i + 1) := sw12._2
+  }
+  
+  val out1D1 = RegNext(out1(stages - 1))
+  out1(stages) := ComplexAdd(out1D1, out2(stages - 1))
+  out2(stages) := ComplexSub(out1D1, out2(stages - 1))
+  val dout1 = Mux(mode, timesInvn(out1(stages)), out1(stages))
+  val dout2 = Mux(mode, timesInvn(out2(stages)), out2(stages))
+  
+  io.dOut1 := RegNext(dout1)
+  io.dOut2 := RegNext(dout2)
+  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
+}
+
+// Cooley-Tukey算法核心模块
+class CooleyTukeyCore extends Module with HasDataConfig with HasElaborateConfig {
+  val io = IO(new FFTCoreIO)
+  
+  val mode = io.mode.getOrElse(false.B)
+  val stages = log2Ceil(FFTLength)
+  
+  // 配置参数
+  val usePipelinedButterfly = true  // 是否使用流水线蝶形运算
+  val pipelineStages = 3           // 蝶形运算流水线级数
+  
+  // 生成旋转因子表
+  def sinTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def sinTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  // 预生成所有阶段的旋转因子表
+  val sinTables = VecInit((0 until stages).map(sinTable))
+  val cosTables = VecInit((0 until stages).map(cosTable))
+  val sinTables2 = VecInit((0 until stages).map(sinTable2))
+  val cosTables2 = VecInit((0 until stages).map(cosTable2))
+  
+  def wnTable(stage: UInt, idx: UInt): MyComplex = {
+    val res = Wire(new MyComplex)
+    val stage_idx = stage % FFTLength.U
+    res.re := Mux(mode, cosTables2(stage)(stage_idx), cosTables(stage)(stage_idx))
+    res.im := Mux(mode, sinTables2(stage)(stage_idx), sinTables(stage)(stage_idx))
+    res
+  }
+  
+  def timesInvn(a: MyComplex): MyComplex = {
+    val b = Wire(new MyComplex)
+    b.re := a.re >> stages
+    b.im := a.im >> stages
+    b
+  }
+  
+  // 流水线蝶形运算单元
+  def PipelinedButterfly(a: MyComplex, b: MyComplex, wn: MyComplex): (MyComplex, MyComplex) = {
+    val (sum, diff) = Butterfly(a, b, wn)
+    val sum_reg = RegNext(sum)
+    val diff_reg = RegNext(diff)
+    (sum_reg, diff_reg)
+  }
+  
+  // 使用寄存器存储中间结果
+  val stage_regs = VecInit(Seq.fill(stages + 1)(RegInit(VecInit(Seq.fill(FFTLength)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex))))))
+  
+  // 流水线寄存器
+  val pipeline_regs = RegInit(VecInit(Seq.fill(pipelineStages)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex))))
+  
+  // 计数器用于控制FFT计算流程
+  val cnt = RegInit(0.U((stages + 1).W))
+  val busy = cnt =/= 0.U
+  when(io.din_valid || busy){
+    cnt := Mux(cnt === (FFTLength - 1).asUInt(), 0.U, cnt + 1.U)
+  }
+  io.busy := busy
+
+  // 初始化第一级输入
+  when(io.din_valid) {
+    stage_regs(0)(cnt) := io.dIn
+  }
+
+  // 计算当前阶段的参数
+  val current_stage = RegInit(0.U(log2Ceil(stages).W))
+  val current_group = RegInit(0.U(log2Ceil(FFTLength).W))
+  val current_idx = RegInit(0.U(log2Ceil(FFTLength).W))
+  
+  // 状态机控制
+  val s_idle :: s_compute :: s_next_group :: s_next_stage :: Nil = Enum(4)
+  val state = RegInit(s_idle)
+  
+  // 计算参数
+  val stage_size = (1.U << current_stage)
+  val group_size = FFTLength.U / stage_size
+  val base_idx = current_group * group_size
+  val idx1 = base_idx + current_idx
+  val idx2 = base_idx + current_idx + (group_size >> 1)
+  val twiddle_idx = current_idx * stage_size
+  
+  // 状态机逻辑
+  switch(state) {
+    is(s_idle) {
+      when(io.din_valid || busy) {
+        state := s_compute
+        current_stage := 0.U
+        current_group := 0.U
+        current_idx := 0.U
+      }
+    }
+    
+    is(s_compute) {
+      // 执行蝶形运算
+      val wn = wnTable(current_stage, twiddle_idx)
+      val butterfly_outputs = if (usePipelinedButterfly) {
+        PipelinedButterfly(stage_regs(current_stage)(idx1), stage_regs(current_stage)(idx2), wn)
+      } else {
+        Butterfly(stage_regs(current_stage)(idx1), stage_regs(current_stage)(idx2), wn)
+      }
+      
+      // 存储结果
+      stage_regs(current_stage + 1.U)(idx1) := butterfly_outputs._1
+      stage_regs(current_stage + 1.U)(idx2) := butterfly_outputs._2
+      
+      // 更新索引
+      when(current_idx === (group_size >> 1) - 1.U) {
+        state := s_next_group
+      }.otherwise {
+        current_idx := current_idx + 1.U
+      }
+    }
+    
+    is(s_next_group) {
+      when(current_group === stage_size - 1.U) {
+        state := s_next_stage
+      }.otherwise {
+        current_group := current_group + 1.U
+        current_idx := 0.U
+        state := s_compute
+      }
+    }
+    
+    is(s_next_stage) {
+      when(current_stage === (stages - 1).U) {
+        state := s_idle
+      }.otherwise {
+        current_stage := current_stage + 1.U
+        current_group := 0.U
+        current_idx := 0.U
+        state := s_compute
+      }
+    }
+  }
+
+  // 输出处理
+  val output_cnt = RegInit(0.U(log2Ceil(FFTLength).W))
+  val output_valid = RegInit(false.B)
+  
+  // 输出计数器控制
+  when(state === s_idle && current_stage === (stages - 1).U) {
+    output_cnt := 0.U
+    output_valid := true.B
+  }.elsewhen(output_valid) {
+    output_cnt := output_cnt + 1.U
+    when(output_cnt === (FFTLength/2 - 1).U) {
+      output_valid := false.B
+    }
+  }
+  
+  // 位反转输出
+  val bit_reversed_idx1 = Reverse(output_cnt << 1.U)
+  val bit_reversed_idx2 = Reverse((output_cnt << 1.U) + 1.U)
+  
+  // 输出流水线
+  val final_output1 = stage_regs(stages)(bit_reversed_idx1)
+  val final_output2 = stage_regs(stages)(bit_reversed_idx2)
+  
+  // 流水线打拍
+  pipeline_regs(0) := Mux(mode, timesInvn(final_output1), final_output1)
+  for (i <- 1 until pipelineStages) {
+    pipeline_regs(i) := RegNext(pipeline_regs(i-1))
+  }
+  
+  io.dOut1 := pipeline_regs(pipelineStages-1)
+  io.dOut2 := Mux(mode, timesInvn(final_output2), final_output2)
+  io.dout_valid := output_valid
+}
+
+// 流水线Cooley-Tukey FFT实现
+class PipelinedCooleyTukeyCore extends Module with HasDataConfig with HasElaborateConfig {
+  val io = IO(new FFTCoreIO)
+  
+  val mode = io.mode.getOrElse(false.B)
+  val stages = log2Ceil(FFTLength)
+  
+  // 生成旋转因子表
+  def sinTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def sinTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def wnTable(k: Int)(idx: UInt): MyComplex = {
+    val res = Wire(new MyComplex)
+    res.re := Mux(mode, cosTable2(k)(idx), cosTable(k)(idx))
+    res.im := Mux(mode, sinTable2(k)(idx), sinTable(k)(idx))
+    res
+  }
+  
+  def timesInvn(a: MyComplex): MyComplex = {
+    val b = Wire(new MyComplex)
+    b.re := a.re >> stages
+    b.im := a.im >> stages
+    b
+  }
+  
+  // 流水线蝶形运算单元
+  def PipelinedButterfly(a: MyComplex, b: MyComplex, wn: MyComplex): (MyComplex, MyComplex) = {
+    val (sum, diff) = Butterfly(a, b, wn)
+    val sum_reg = RegNext(sum)
+    val diff_reg = RegNext(diff)
+    (sum_reg, diff_reg)
+  }
+  
+  // 使用寄存器存储中间结果
+  val out1 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  val out2 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  
+  // 计数器用于控制FFT计算流程
+  val cnt = RegInit(0.U((stages + 1).W))
+  val busy = cnt =/= 0.U
+  when(io.din_valid || busy){
+    cnt := Mux(cnt === (FFTLength - 1).asUInt(), 0.U, cnt + 1.U)
+  }
+  io.busy := busy
+  
+  // 初始化第一级输入
+  out1(0) := io.dIn
+  out2(0) := io.dIn
+  
+  // 流水线Cooley-Tukey FFT实现
+  for (i <- 0 until stages) {
+    val stage_size = pow(2, i).toInt
+    val group_size = FFTLength / stage_size
+    val wnCtrl = cnt(stages-1-i, 0)
+    val wn = wnTable(i)(wnCtrl)
+    
+    // 使用流水线蝶形运算
+    val BF12 = PipelinedButterfly(out1(i), out2(i), wn)
+    
+    // 存储结果到下一级
+    out1(i + 1) := BF12._1
+    out2(i + 1) := BF12._2
+  }
+  
+  // 输出处理
+  val dout1 = Mux(mode, timesInvn(out1(stages)), out1(stages))
+  val dout2 = Mux(mode, timesInvn(out2(stages)), out2(stages))
+  
+  io.dOut1 := RegNext(dout1)
+  io.dOut2 := RegNext(dout2)
+  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
+}
