@@ -1,34 +1,210 @@
-
 package FFT
 
 import chisel3._
 import chisel3.util._
 
-/**
-  *
-  * FFT top with output FIFO and decoupled IO
-  *
-  */
+// AXI-lite从机接口定义 - 64位数据宽度
+class AXI4LiteSlaveBundle(addrWidth: Int = 32, dataWidth: Int = 64) extends Bundle {
+  val awaddr  = Input(UInt(addrWidth.W))
+  val awvalid = Input(Bool())
+  val awready = Output(Bool())
+  val wdata   = Input(UInt(dataWidth.W))
+  val wstrb   = Input(UInt((dataWidth/8).W))
+  val wvalid  = Input(Bool())
+  val wready  = Output(Bool())
+  val bresp   = Output(UInt(2.W))
+  val bvalid  = Output(Bool())
+  val bready  = Input(Bool())
+  val araddr  = Input(UInt(addrWidth.W))
+  val arvalid = Input(Bool())
+  val arready = Output(Bool())
+  val rdata   = Output(UInt(dataWidth.W))
+  val rresp   = Output(UInt(2.W))
+  val rvalid  = Output(Bool())
+  val rready  = Input(Bool())
+}
 
-class TOP extends Module
-  with HasDataConfig
-  with HasElaborateConfig {
+class TOP extends Module with HasDataConfig with HasElaborateConfig {
   val io = IO(new Bundle{
     val mode = if(supportIFFT) Some(Input(Bool())) else None
-    val din = Flipped(DecoupledIO(new MyComplex))
-    val dout = DecoupledIO(new MyComplex)
+    val axi = new AXI4LiteSlaveBundle(32, 64)
   })
+
+  // 创建虚拟的DecoupledIO接口用于内部FFT连接
+  val din = Wire(Flipped(DecoupledIO(new MyComplex)))
+  val dout = Wire(DecoupledIO(new MyComplex))
+  
+  // 完全保持原始的FFT连接逻辑
   val FFT = Module(new FFTReorder)
   val FIFOcmd = Wire(DecoupledIO(new MyComplex))
   FIFOcmd.valid := FFT.io.dout_valid
   FIFOcmd.bits := FFT.io.dOut
   val FIFO = Queue(FIFOcmd, 2 * FFTLength)
-  FIFO.ready := io.dout.ready
-
-  io.din.ready := FIFOcmd.ready && !FFT.io.busy
-  FFT.io.din_valid := io.din.fire()
-  FFT.io.dIn := io.din.bits
-
-  io.dout.valid := FIFO.fire()
-  io.dout.bits := FIFO.bits
+  
+  FIFO.ready := dout.ready
+  din.ready := FIFOcmd.ready && !FFT.io.busy
+  FFT.io.din_valid := din.fire()
+  FFT.io.dIn := din.bits
+  dout.valid := FIFO.fire()
+  dout.bits := FIFO.bits
+  
+  // 三阶段状态机：INPUT -> PROCESSING -> OUTPUT
+  val sInput :: sProcessing :: sOutput :: Nil = Enum(3)
+  val fftState = RegInit(sInput)
+  
+  // 存储FFT输入和输出数据
+  val inputMem = Mem(FFTLength, UInt(64.W))
+  val outputMem = Mem(FFTLength, UInt(64.W))
+  
+  // 计数器
+  val inputCount = RegInit(0.U(log2Ceil(FFTLength + 1).W))    // 接收的输入数量
+  val outputCount = RegInit(0.U(log2Ceil(FFTLength + 1).W))   // 收集的输出数量
+  val readCount = RegInit(0.U(log2Ceil(FFTLength + 1).W))     // AXI读取计数
+  val processCycle = RegInit(0.U(log2Ceil(FFTLength + 10).W)) // 处理周期计数
+  
+  // FFT输入控制 - 严格模拟原始逻辑
+  din.valid := false.B
+  din.bits.re := 0.S.asFixedPoint(BinaryPoint.BP)
+  din.bits.im := 0.S.asFixedPoint(BinaryPoint.BP)
+  
+  // FFT输出控制 - 等价于原始的dout.ready=1
+  dout.ready := true.B
+  
+  // FFT状态机
+  switch(fftState) {
+    is(sInput) {
+      // 输入阶段：接收FFTLength个复数，模拟原始的输入循环
+      when(inputCount === FFTLength.U) {
+        fftState := sProcessing
+        processCycle := 0.U
+        printf("FFT_PHASE: Input complete, starting processing\n")
+      }
+    }
+    
+    is(sProcessing) {
+      // 处理阶段：模拟原始的输入循环+等待时间
+      processCycle := processCycle + 1.U
+      
+      // 前FFTLength个周期：逐个输入到FFT（模拟原始的step(1)循环）
+      when(processCycle < FFTLength.U) {
+        val inputData = inputMem(processCycle)
+        din.bits.re := inputData(31, 0).asSInt.asFixedPoint(BinaryPoint.BP)
+        din.bits.im := inputData(63, 32).asSInt.asFixedPoint(BinaryPoint.BP)
+        
+        // 只有第一个数据设置valid=1，等价于原始的if (i == 0) din.valid=1
+        din.valid := processCycle === 0.U
+        
+        when(processCycle < 3.U) {
+          printf("FFT_INPUT[%d]: re=%d, im=%d, valid=%d\n", 
+                 processCycle, inputData(31, 0).asSInt, inputData(63, 32).asSInt, din.valid)
+        }
+      }
+      
+      // 等待FFT计算完成：FFTLength + (FFTLength/2 + 1)个周期
+      when(processCycle === (FFTLength + FFTLength/2 + 1).U) {
+        fftState := sOutput
+        printf("FFT_PHASE: Processing complete, ready for output\n")
+      }
+    }
+    
+    is(sOutput) {
+      // 输出阶段：允许读取FFTLength个复数
+      when(readCount === FFTLength.U) {
+        fftState := sInput
+        inputCount := 0.U
+        outputCount := 0.U
+        readCount := 0.U
+        printf("FFT_PHASE: Output complete, ready for next input\n")
+      }
+    }
+  }
+  
+  // 收集FFT输出数据
+  when(dout.fire()) {
+    val outputData = Cat(dout.bits.im.asSInt.asUInt, dout.bits.re.asSInt.asUInt)
+    outputMem(outputCount) := outputData
+    
+    when(outputCount < 3.U) {
+      printf("FFT_OUTPUT[%d]: re=%d, im=%d\n", 
+             outputCount, dout.bits.re.asSInt, dout.bits.im.asSInt)
+    }
+    
+    outputCount := outputCount + 1.U
+  }
+  
+  // AXI状态机
+  val sIdle :: sWrite :: sRead :: Nil = Enum(3)
+  val axiState = RegInit(sIdle)
+  
+  val bvalidReg = RegInit(false.B)
+  val rvalidReg = RegInit(false.B)
+  val rdataReg = RegInit(0.U(64.W))
+  
+  // AXI信号控制：严格按阶段控制
+  io.axi.awready := axiState === sIdle && fftState === sInput && inputCount < FFTLength.U
+  io.axi.wready := axiState === sWrite
+  io.axi.bvalid := bvalidReg
+  io.axi.bresp := 0.U
+  io.axi.arready := axiState === sIdle && fftState === sOutput && readCount < FFTLength.U
+  io.axi.rvalid := rvalidReg
+  io.axi.rdata := rdataReg
+  io.axi.rresp := 0.U
+  
+  switch(axiState) {
+    is(sIdle) {
+      bvalidReg := false.B
+      rvalidReg := false.B
+      
+      // 只在INPUT阶段接受写请求
+      when(io.axi.awvalid && io.axi.awready && fftState === sInput) {
+        axiState := sWrite
+        when(inputCount < 3.U) {
+          printf("AXI_WRITE_REQ[%d] in INPUT phase\n", inputCount)
+        }
+      }.elsewhen(io.axi.arvalid && io.axi.arready && fftState === sOutput) {
+        // 只在OUTPUT阶段接受读请求
+        axiState := sRead
+        rdataReg := outputMem(readCount)
+        rvalidReg := true.B
+        
+        when(readCount < 3.U) {
+          printf("AXI_READ_REQ[%d] in OUTPUT phase, data=0x%x\n", readCount, outputMem(readCount))
+        }
+      }
+    }
+    
+    is(sWrite) {
+      when(io.axi.wvalid && io.axi.wready) {
+        axiState := sIdle
+        bvalidReg := true.B
+        
+        // 存储输入数据
+        inputMem(inputCount) := io.axi.wdata
+        
+        when(inputCount < 3.U) {
+          printf("AXI_WRITE_DATA[%d] = 0x%x\n", inputCount, io.axi.wdata)
+        }
+        
+        inputCount := inputCount + 1.U
+      }
+    }
+    
+    is(sRead) {
+      when(io.axi.rready && io.axi.rvalid) {
+        axiState := sIdle
+        rvalidReg := false.B
+        
+        when(readCount < 3.U) {
+          printf("AXI_READ_COMPLETE[%d]\n", readCount)
+        }
+        
+        readCount := readCount + 1.U
+      }
+    }
+  }
+  
+  // 写响应握手处理
+  when(io.axi.bready && io.axi.bvalid) {
+    bvalidReg := false.B
+  }
 }
