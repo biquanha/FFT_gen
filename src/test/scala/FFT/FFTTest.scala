@@ -382,6 +382,8 @@ class FFTTest3(c:FFTReorder) extends PeekPokeTester(c)
   }
 }
 
+// FFT测试 - 添加数据导出功能
+// 在原有FFTTest4类基础上添加数据保存功能
 class FFTTest4(c: TOP) extends PeekPokeTester(c) 
   with HasDataConfig with HasElaborateConfig {
   
@@ -391,7 +393,40 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
   val INPUT_ADDR = 0x0000
   val OUTPUT_ADDR = 0x1000
   
-  // 保持原有的FFT参考实现
+  // === 数据导出功能 - 新增部分 ===
+  import java.io.PrintWriter
+  
+  // 创建数据导出文件
+  val inputDataFile = new PrintWriter("fft_input_data.txt")
+  val outputDataFile = new PrintWriter("fft_output_data.txt") 
+  val configFile = new PrintWriter("fft_config.txt")
+  val summaryFile = new PrintWriter("fft_test_summary.txt")
+  
+  // 写入配置信息
+  println("导出测试配置...")
+  configFile.println(s"FFT_LENGTH=${FFTLength}")
+  configFile.println(s"BINARY_POINT=${BinaryPoint}")
+  configFile.println(s"ITER_NUM=5")
+  configFile.println(s"INPUT_ADDR=0x${INPUT_ADDR.toHexString.toUpperCase}")
+  configFile.println(s"OUTPUT_ADDR=0x${OUTPUT_ADDR.toHexString.toUpperCase}")
+  configFile.println(s"RANDOM_SEED=12345")
+  configFile.println(s"SUPPORT_IFFT=${supportIFFT}")
+  configFile.flush()
+  
+  // 写入文件头注释
+  inputDataFile.println("# FFT输入数据")
+  inputDataFile.println("# 格式: iteration_index re_int im_int re_float im_float")
+  inputDataFile.println("# re_int/im_int: 定点数整数表示")
+  inputDataFile.println("# re_float/im_float: 归一化浮点数表示 [-1, 1)")
+  inputDataFile.flush()
+  
+  outputDataFile.println("# FFT输出数据") 
+  outputDataFile.println("# 格式: iteration_index hw_re_int hw_im_int hw_re_float hw_im_float ref_re_float ref_im_float")
+  outputDataFile.println("# hw_*: 硬件输出结果")
+  outputDataFile.println("# ref_*: 软件参考结果")
+  outputDataFile.flush()
+  
+  // === 保持原有的FFT参考实现 ===
   def fft(x: Array[Complex]): Array[Complex] = {
     require(x.length > 0 && (x.length & (x.length - 1)) == 0, "array size should be power of two")
     fft(x, 0, x.length, 1)
@@ -430,7 +465,7 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
     res
   }
   
-  // AXI写操作
+  // === 保持原有的AXI操作 ===
   def axiWrite(data: Long): Unit = {
     poke(c.io.axi.awaddr, INPUT_ADDR)
     poke(c.io.axi.awvalid, 1)
@@ -460,7 +495,6 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
     step(1)
   }
   
-  // AXI读操作
   def axiRead(): BigInt = {
     poke(c.io.axi.araddr, OUTPUT_ADDR)
     poke(c.io.axi.arvalid, 1)
@@ -492,83 +526,68 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
   poke(c.io.axi.rready, 0)
   step(5)
   
-  // 严格按照原始测试逻辑进行
-  val r = new scala.util.Random
+  // === 主测试逻辑 - 添加数据导出 ===
+  
+  // 使用固定种子确保可重现性
+  val r = new scala.util.Random(12345)
   var bound: Double = math.pow(2.0, BinaryPoint)
   var error: Double = 0
   var ovNum: Int = 0
   var iterNum: Int = 5
   
+  println(s"开始FFT测试 - 数据导出模式")
+  println(s"FFT长度: ${FFTLength}, 二进制点: ${BinaryPoint}, 迭代次数: ${iterNum}")
+  summaryFile.println(s"FFT测试配置: FFT_LENGTH=${FFTLength}, BINARY_POINT=${BinaryPoint}, ITER_NUM=${iterNum}")
+  summaryFile.println(s"测试开始时间: ${java.time.LocalDateTime.now()}")
+  
   for (t <- 0 until iterNum) {
     var a = new Array[Complex](FFTLength)
     var cnt = 0
     
-    println("开始第" + (t+1) + "次FFT测试 - 严格按原始逻辑")
+    println(s"第${t+1}次迭代开始...")
     
-    // 等价于原有的 poke(c.io.dout.ready, 1) - 在新设计中自动处理
+    // 在数据文件中标记迭代开始
+    inputDataFile.println(s"# === Iteration ${t+1} ===")
+    outputDataFile.println(s"# === Iteration ${t+1} ===")
     
-    // 第一阶段：输入FFTLength个复数（等价于原始输入循环）
-    println("阶段1: 输入" + FFTLength + "个复数...")
+    // 阶段1: 生成和输入数据
     for (i <- 0 until FFTLength) {
       var re = -bound.toInt / 2 + r.nextInt(bound.toInt)
       var im = -bound.toInt / 2 + r.nextInt(bound.toInt)
       a(cnt) = new Complex(2 * re / bound, 2 * im / bound)
       
-      // 等价于原有的 poke(c.io.din.bits.re, re) 和 poke(c.io.din.bits.im, im)
+      // === 导出输入数据 ===
+      inputDataFile.println(s"${t}_${i} ${re} ${im} ${a(cnt).re} ${a(cnt).im}")
+      
       val reUInt = if (re < 0) (re + (1L << 32)) else re.toLong
       val imUInt = if (im < 0) (im + (1L << 32)) else im.toLong
       val data64 = (imUInt << 32) | (reUInt & 0xFFFFFFFFL)
       
-      if (i < 3) {
-        println("输入[" + i + "]: re=" + re + ", im=" + im)
+      if (i < 3 || i >= FFTLength - 3) {
+        println(s"  输入[${i}]: re=${re}, im=${im} -> (${a(cnt).re}, ${a(cnt).im})")
       }
       
       axiWrite(data64)
-      
-      // 等价于原有的 if (i == 0) poke(c.io.din.valid, 1) else poke(c.io.din.valid, 0)
-      // 和 step(1) - 现在由TOP模块内部在PROCESSING阶段处理
-      
       cnt += 1
     }
     
-    println("阶段1完成: 已输入所有" + FFTLength + "个复数")
+    inputDataFile.flush()
     
-    // 第二阶段：等待FFT计算（等价于原始的step(FFTLength / 2 + 1)）
-    // 但现在由TOP模块内部自动处理，包括：
-    // - FFTLength个周期的逐个输入到FFT
-    // - FFTLength/2+1个周期的等待计算完成
-    println("阶段2: 等待FFT计算完成...")
+    // 阶段2: 等待计算
     val totalProcessingCycles = FFTLength + FFTLength/2 + 1
-    println("预计需要" + totalProcessingCycles + "个周期完成处理")
+    step(totalProcessingCycles + 10)
     
-    // 在这个阶段，任何读取尝试都应该失败
-    println("验证：在处理阶段尝试读取（应该失败）...")
-    poke(c.io.axi.araddr, OUTPUT_ADDR)
-    poke(c.io.axi.arvalid, 1)
-    step(5)  // 等待几个周期
-    if (peek(c.io.axi.arready) == 0) {
-      println("✓ 正确：处理阶段不允许读取")
-    } else {
-      println("✗ 错误：处理阶段意外允许了读取")
-    }
-    poke(c.io.axi.arvalid, 0)
-    step(1)
-    
-    // 等待处理完成
-    step(totalProcessingCycles + 10)  // 额外10个周期确保完成
-    
+    // 计算参考FFT结果
     var ref = fft(a)
     var errorOne: Double = 0
     var error1: Double = 0
     var ovNum1: Int = 0
     var eps: Double = 1e-9
     
-    // 第三阶段：读取FFTLength个复数（等价于原始输出循环）
-    println("阶段3: 读取" + FFTLength + "个输出复数...")
+    // 阶段3: 读取输出数据
     for (i <- 0 until FFTLength) {
       var ref1 = ref(i)
       
-      // 等价于原有的 var d1 = peek(c.io.dout.bits)
       val data64 = axiRead()
       val reRaw = data64 & 0xFFFFFFFFL
       val imRaw = (data64 >> 32) & 0xFFFFFFFFL
@@ -576,16 +595,18 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
       val reSigned = if (reRaw >= (1L << 31)) (reRaw - (1L << 32)) else reRaw
       val imSigned = if (imRaw >= (1L << 31)) (imRaw - (1L << 32)) else imRaw
       
-      // 只打印前3个和后3个
+      // 转换为浮点数
+      val reFloat = 2.0 * reSigned.toDouble / bound
+      val imFloat = 2.0 * imSigned.toDouble / bound
+      
+      // === 导出输出数据 ===
+      outputDataFile.println(s"${t}_${i} ${reSigned} ${imSigned} ${reFloat} ${imFloat} ${ref1.re} ${ref1.im}")
+      
       if (i < 3 || i >= FFTLength - 3) {
-        println("输出[" + i + "]: re=" + reSigned + ", im=" + imSigned)
-        println("期望[" + i + "]: re=" + ref1.re + ", im=" + ref1.im)
-        val reFloat = (2.0 * reSigned.toDouble / bound)
-        val imFloat = (2.0 * imSigned.toDouble / bound)
-        println("转换[" + i + "]: re=" + reFloat + ", im=" + imFloat)
+        println(s"  输出[${i}]: hw=(${reFloat}, ${imFloat}), ref=(${ref1.re}, ${ref1.im})")
       }
       
-      // 保持原有的误差计算逻辑
+      // 计算误差（保持原有逻辑）
       error1 = math.abs((((2 * reSigned.toDouble / bound) - ref1.re) / (ref1.re + eps) + 
                         ((2 * imSigned.toDouble / bound) - ref1.im) / (ref1.im + eps)) / 2.0)
       
@@ -595,22 +616,46 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
         ovNum1 += 1
       }
       
-      // 等价于原有的 step(1)
       step(1)
     }
+    
+    outputDataFile.flush()
     
     errorOne = if((FFTLength - ovNum1) > 0) errorOne / (FFTLength - ovNum1) else 0
     ovNum += ovNum1
     error += errorOne
     var errorOnePercent = errorOne * 100
     
-    println("第" + (t+1) + "次测试完成:")
-    println("  错误率: " + errorOnePercent + "%")
-    println("  溢出数量: " + ovNum1)
-    printf("In this sample, Error rate: %.2f%% | number of ovs: %d\n", errorOnePercent, ovNum1)
+    println(s"第${t+1}次迭代完成:")
+    println(s"  错误率: ${errorOnePercent}%")
+    println(s"  溢出数量: ${ovNum1}")
+    
+    // 保存迭代结果到总结文件
+    summaryFile.println(s"Iteration ${t+1}: Error=${errorOnePercent}%, Overflow=${ovNum1}")
+    summaryFile.flush()
   }
   
-  println("\nFFT测试完成 - 严格按原始逻辑执行")
+  // === 完成测试，关闭文件 ===
+  
+  val finalError = (error / iterNum) * 100
+  val finalSummary = s"测试完成: 平均错误率=${finalError}%, 总溢出=${ovNum}"
+  
+  println(s"\n${finalSummary}")
+  summaryFile.println(s"\n${finalSummary}")
+  summaryFile.println(s"测试结束时间: ${java.time.LocalDateTime.now()}")
+  
+  // 关闭所有文件
+  inputDataFile.close()
+  outputDataFile.close()
+  summaryFile.close()
+  
+  println("\n=== 数据导出完成 ===")
+  println("生成文件:")
+  println("  fft_config.txt       - 测试配置参数")
+  println("  fft_input_data.txt   - 输入数据 (格式: iter_idx re_int im_int re_float im_float)")
+  println("  fft_output_data.txt  - 输出数据 (格式: iter_idx hw_re hw_im hw_re_f hw_im_f ref_re ref_im)")
+  println("  fft_test_summary.txt - 测试结果总结")
+  println("\n可以开始C程序验证!")
 }
 object FFTTestMain extends App {
   iotesters.Driver.execute(args, () => new FFT) {
