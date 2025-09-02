@@ -1,0 +1,10 @@
+FFT测试配置: FFT_LENGTH=512, BINARY_POINT=16, ITER_NUM=5
+测试开始时间: 2025-09-02T22:09:01.978096
+Iteration 1: Error=0.007605514871690853%, Overflow=0
+Iteration 2: Error=0.0077990168517767505%, Overflow=0
+Iteration 3: Error=0.007143244019207332%, Overflow=0
+Iteration 4: Error=0.005289361855676363%, Overflow=0
+Iteration 5: Error=0.011502043446235202%, Overflow=0
+
+测试完成: 平均错误率=0.007867836208917301%, 总溢出=0
+测试结束时间: 2025-09-02T22:09:11.483913
