@@ -535,9 +535,11 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
   var ovNum: Int = 0
   var iterNum: Int = 5
   
-  println(s"开始FFT测试 - 数据导出模式")
+  println(s"开始FFT测试 - 正弦波输入模式")
   println(s"FFT长度: ${FFTLength}, 二进制点: ${BinaryPoint}, 迭代次数: ${iterNum}")
+  println(s"输入信号: 正弦波, 周期=256点, 虚部=0")
   summaryFile.println(s"FFT测试配置: FFT_LENGTH=${FFTLength}, BINARY_POINT=${BinaryPoint}, ITER_NUM=${iterNum}")
+  summaryFile.println(s"输入信号类型: 正弦波 (周期256点, 虚部恒为0)")
   summaryFile.println(s"测试开始时间: ${java.time.LocalDateTime.now()}")
   
   for (t <- 0 until iterNum) {
@@ -545,31 +547,57 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
     var cnt = 0
     
     println(s"第${t+1}次迭代开始...")
+    println(s"  生成正弦波: 频率=${FFTLength/256.0}Hz (在${FFTLength}点FFT中)")
     
     // 在数据文件中标记迭代开始
     inputDataFile.println(s"# === Iteration ${t+1} ===")
     outputDataFile.println(s"# === Iteration ${t+1} ===")
     
-    // 阶段1: 生成和输入数据
+    // 阶段1: 生成和输入数据 - 使用正弦波
+    // 生成正弦波数据，虚部为0
+    // 对于512点FFT，能量会集中，需要更小的输入避免溢出
+    // BinaryPoint=31时，使用Q1.31格式，范围是[-1, 1)
+    // 为避免溢出，使用较小的幅度
+    // 修改：从bound/256改为bound/1024，避免FFT输出溢出
+    // FFT增益约为N/2=256，所以输入幅度应小于满量程的1/256
+    val amplitude = bound / 1024.0  // 避免FFT输出溢出
+    var minVal = Int.MaxValue
+    var maxVal = Int.MinValue
+    
     for (i <- 0 until FFTLength) {
-      var re = -bound.toInt / 2 + r.nextInt(bound.toInt)
-      var im = -bound.toInt / 2 + r.nextInt(bound.toInt)
-      a(cnt) = new Complex(2 * re / bound, 2 * im / bound)
+      // 计算正弦波值 - 每个周期256个点
+      val angle = 2.0 * math.Pi * i / 256.0
+      val sin_value = amplitude * math.sin(angle)
+      
+      // 转换为定点数整数
+      var re = sin_value.toInt
+      var im = 0  // 虚部始终为0
+      
+      // 归一化到[-1, 1]范围存储到Complex数组
+      a(cnt) = new Complex(2.0 * re / bound, 0.0)
+      
+      // 记录最大最小值
+      if (re < minVal) minVal = re
+      if (re > maxVal) maxVal = re
       
       // === 导出输入数据 ===
       inputDataFile.println(s"${t}_${i} ${re} ${im} ${a(cnt).re} ${a(cnt).im}")
       
+      // 处理有符号数
       val reUInt = if (re < 0) (re + (1L << 32)) else re.toLong
       val imUInt = if (im < 0) (im + (1L << 32)) else im.toLong
       val data64 = (imUInt << 32) | (reUInt & 0xFFFFFFFFL)
       
-      if (i < 3 || i >= FFTLength - 3) {
-        println(s"  输入[${i}]: re=${re}, im=${im} -> (${a(cnt).re}, ${a(cnt).im})")
+      if (i < 5 || i >= FFTLength - 3 || i == 64 || i == 128 || i == 192 || i == 256 || i == 320 || i == 384 || i == 448) {
+        println(f"  输入[${i}%3d]: re=${re}%6d, im=${im}%6d -> 归一化后: (${a(cnt).re}%.6f, ${a(cnt).im}%.6f)")
       }
       
       axiWrite(data64)
       cnt += 1
     }
+    
+    println(s"  正弦波数值范围: [${minVal}, ${maxVal}]")
+    println(s"  正弦波周期: 256点, 频率bin: ${FFTLength/256}")
     
     inputDataFile.flush()
     

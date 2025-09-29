@@ -27,17 +27,17 @@ class FFT extends Module
   
   fftAlgorithm match {
     case FFTAlgorithm.R2MDC => {
-      println("[DEBUG] Instantiating r2mdcCore")
+      println("[DEBUG] Instantiating R2MDCCore")
       val r2mdcCore = Module(new R2MDCCore())
       r2mdcCore.io <> io
     }
-    case FFTAlgorithm.CooleyTukey => {
-      println("[DEBUG] Instantiating CooleyTukeyCore")
-      val cooleyTukeyCore = Module(new CooleyTukeyCore())
-      cooleyTukeyCore.io <> io
+    case FFTAlgorithm.R2MDC_Optimized => {
+      println("[DEBUG] Instantiating R2MDC_Optimized (OptimizedR2MDCCore)")
+      val optimizedCore = Module(new OptimizedR2MDCCore())
+      optimizedCore.io <> io
     }
     case _ => {
-      println("[DEBUG] Falling back to default R2MDC")
+      println("[DEBUG] Unknown algorithm, falling back to R2MDC")
       val r2mdcCore = Module(new R2MDCCore())
       r2mdcCore.io <> io
     }
