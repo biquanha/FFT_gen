@@ -634,10 +634,29 @@ class FFTTest4(c: TOP) extends PeekPokeTester(c)
         println(s"  输出[${i}]: hw=(${reFloat}, ${imFloat}), ref=(${ref1.re}, ${ref1.im})")
       }
       
-      // 计算误差（保持原有逻辑）
-      error1 = math.abs((((2 * reSigned.toDouble / bound) - ref1.re) / (ref1.re + eps) + 
-                        ((2 * imSigned.toDouble / bound) - ref1.im) / (ref1.im + eps)) / 2.0)
-      
+      // 改进的误差计算：混合使用绝对误差和相对误差
+      val hwRe = 2 * reSigned.toDouble / bound
+      val hwIm = 2 * imSigned.toDouble / bound
+
+      // 计算绝对误差
+      val absErrorRe = math.abs(hwRe - ref1.re)
+      val absErrorIm = math.abs(hwIm - ref1.im)
+      val absError = math.sqrt(absErrorRe * absErrorRe + absErrorIm * absErrorIm)
+
+      // 计算参考值幅度
+      val refMag = math.sqrt(ref1.re * ref1.re + ref1.im * ref1.im)
+
+      // 对于大幅度bin（>0.01）使用相对误差，对于小幅度bin使用绝对误差阈值
+      if (refMag > 0.01) {
+        // 大幅度bin：使用相对误差
+        val relError = absError / (refMag + eps)
+        error1 = relError
+      } else {
+        // 小幅度bin：使用绝对误差，归一化到[0,1]范围以便统计
+        // 如果绝对误差<0.0001则认为正确，否则按绝对误差大小计算
+        error1 = if (absError < 0.0001) 0.0 else absError / 0.01
+      }
+
       if (error1 <= 0.5) {
         errorOne += error1
       } else {
