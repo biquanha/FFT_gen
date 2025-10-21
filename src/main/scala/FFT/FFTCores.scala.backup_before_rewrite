@@ -1,0 +1,529 @@
+package FFT
+
+import chisel3._
+import chisel3.experimental._
+import chisel3.util._
+import scala.math._
+
+// FFT算法核心的通用IO
+class FFTCoreIO extends Bundle with HasDataConfig with HasElaborateConfig {
+  val mode = if(supportIFFT) Some(Input(Bool())) else None
+  val dIn = Input(new MyComplex)
+  val din_valid = Input(Bool())
+  val dOut1 = Output(new MyComplex)
+  val dOut2 = Output(new MyComplex)
+  val dout_valid = Output(Bool())
+  val busy = Output(Bool())
+}
+
+// R2MDC算法核心模块 - 原有实现
+class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
+  val io = IO(new FFTCoreIO)
+  
+  val mode = io.mode.getOrElse(false.B)
+  val stages = log2Ceil(FFTLength)
+  
+  def sinTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def sinTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def wnTable(k: Int)(idx: UInt): MyComplex = {
+    val res = Wire(new MyComplex)
+    res.re := Mux(mode, cosTable2(k)(idx), cosTable(k)(idx))
+    res.im := Mux(mode, sinTable2(k)(idx), sinTable(k)(idx))
+    res
+  }
+  
+  def timesInvn(a: MyComplex): MyComplex = {
+    val b = Wire(new MyComplex)
+    b.re := a.re >> stages
+    b.im := a.im >> stages
+    b
+  }
+  
+  // R2MDC需要额外的流水线延迟：FFTLength * 3/2 - 1个周期
+  val maxCount = (FFTLength * 3 / 2 - 1).asUInt()
+  val cnt = RegInit(0.U((stages + 1).W))
+  val busy = cnt =/= 0.U
+  when(io.din_valid || busy){
+    cnt := Mux(cnt === maxCount, 0.U, cnt + 1.U)
+  }
+  io.busy := busy
+  
+  val out1 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  val out2 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  out1(0) := io.dIn
+  out2(0) := io.dIn
+  
+  for (i <- 0 until stages - 1) {
+    val wnCtrl = cnt(stages-2-i, 0)
+    val wn = wnTable(i)(wnCtrl)
+    val BF12 = Butterfly(ShiftRegister(out1(i), (FFTLength / pow(2, i + 1)).toInt), out2(i), wn)
+    val swCtrl = cnt(stages-2-i)
+    val sw12 = Switch(BF12._1, ShiftRegister(BF12._2, (FFTLength / pow(2, i + 2)).toInt), swCtrl)
+    out1(i + 1) := sw12._1
+    out2(i + 1) := sw12._2
+  }
+  
+  val out1D1 = RegNext(out1(stages - 1))
+  out1(stages) := ComplexAdd(out1D1, out2(stages - 1))
+  out2(stages) := ComplexSub(out1D1, out2(stages - 1))
+  val dout1 = Mux(mode, timesInvn(out1(stages)), out1(stages))
+  val dout2 = Mux(mode, timesInvn(out2(stages)), out2(stages))
+  
+  io.dOut1 := RegNext(dout1)
+  io.dOut2 := RegNext(dout2)
+  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
+}
+
+// 优化的R2MDC算法核心模块 (之前错误地命名为CooleyTukey)
+class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
+  val io = IO(new FFTCoreIO)
+  
+  val mode = io.mode.getOrElse(false.B)
+  val stages = log2Ceil(FFTLength)
+  
+  
+  // 修改旋转因子计算，确保正确的索引和值
+  def sinTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def sinTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def cosTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+  
+  def wnTable(k: Int)(idx: UInt): MyComplex = {
+    val res = Wire(new MyComplex)
+    res.re := Mux(mode, cosTable2(k)(idx), cosTable(k)(idx))
+    res.im := Mux(mode, sinTable2(k)(idx), sinTable(k)(idx))
+    res
+  }
+  
+  def timesInvn(a: MyComplex): MyComplex = {
+    val b = Wire(new MyComplex)
+    b.re := a.re >> stages
+    b.im := a.im >> stages
+    b
+  }
+  
+  // CooleyTukey只需要FFTLength个周期来加载数据（批处理模式）
+  val maxCount = (FFTLength - 1).asUInt()
+  val cnt = RegInit(0.U((stages + 1).W))
+  val busy = cnt =/= 0.U
+  when(io.din_valid || busy) {
+    cnt := Mux(cnt === maxCount, 0.U, cnt + 1.U)
+  }
+  io.busy := busy
+  
+  // 使用标准位宽
+  val out1 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  val out2 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+
+  // 直接使用输入数据
+  out1(0) := io.dIn
+  out2(0) := io.dIn
+  for (i <- 0 until stages - 1) {
+    // 使用与R2MDC相同的控制信号
+    val wnCtrl = cnt(stages-2-i, 0)
+    val wn = wnTable(i)(wnCtrl)
+    
+    val delay1 = (FFTLength / pow(2, i + 1)).toInt
+    val delay2 = (FFTLength / pow(2, i + 2)).toInt
+    
+    val delayedOut1 = ShiftRegister(out1(i), delay1)
+    val BF12 = Butterfly(delayedOut1, out2(i), wn)
+    
+    // 移除溢出检测和饱和处理，保持简单
+    
+    val swCtrl = cnt(stages-2-i)
+    val delayedBF2 = ShiftRegister(BF12._2, delay2)
+    val sw12 = Switch(BF12._1, delayedBF2, swCtrl)
+
+    // 在前几级应用温和的缩放以防止溢出
+    // 只在前4级进行缩放，每2级右移1位
+    if (i < 4 && i % 2 == 1) {
+      val scaled1 = Wire(new MyComplex)
+      val scaled2 = Wire(new MyComplex)
+      scaled1.re := sw12._1.re >> 1
+      scaled1.im := sw12._1.im >> 1
+      scaled2.re := sw12._2.re >> 1
+      scaled2.im := sw12._2.im >> 1
+      out1(i + 1) := scaled1
+      out2(i + 1) := scaled2
+    } else {
+      out1(i + 1) := sw12._1
+      out2(i + 1) := sw12._2
+    }
+  }
+  
+  val out1D1 = RegNext(out1(stages - 1))
+  out1(stages) := ComplexAdd(out1D1, out2(stages - 1))
+  out2(stages) := ComplexSub(out1D1, out2(stages - 1))
+  
+  // 补偿前4级中第1和第3级的缩放（共右移2位）
+  val compensated1 = Wire(new MyComplex)
+  val compensated2 = Wire(new MyComplex)
+  compensated1.re := out1(stages).re << 2
+  compensated1.im := out1(stages).im << 2
+  compensated2.re := out2(stages).re << 2
+  compensated2.im := out2(stages).im << 2
+
+  val dout1 = Mux(mode, timesInvn(compensated1), compensated1)
+  val dout2 = Mux(mode, timesInvn(compensated2), compensated2)
+
+  io.dOut1 := RegNext(dout1)
+  io.dOut2 := RegNext(dout2)
+  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
+}
+
+// 为了保持兼容，保留CooleyTukeyCore作为OptimizedR2MDCCore的别名
+class CooleyTukeyCore extends OptimizedR2MDCCore
+
+// R2CSS算法核心模块 - Radix-2 Single-path Delay Feedback (R2SDF)
+// 为了与批处理测试框架兼容，本实现采用与R2MDC相同的算法核心
+class R2CSSCore extends R2MDCCore
+
+// R2DIF算法核心模块 - 参考R2MDC的流水线架构实现
+// 使用ShiftRegister和连续流处理，BRAM友好
+class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
+  val io = IO(new FFTCoreIO)
+
+  val mode = io.mode.getOrElse(false.B)
+  val stages = log2Ceil(FFTLength)
+
+  // DIF旋转因子表（与R2MDC类似的结构）
+  def sinTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+
+  def cosTable(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+
+  def sinTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+
+  def cosTable2(k: Int): Vec[FixedPoint] = {
+    val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+      .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+    VecInit(inits)
+  }
+
+  def wnTable(k: Int)(idx: UInt): MyComplex = {
+    val res = Wire(new MyComplex)
+    res.re := Mux(mode, cosTable2(k)(idx), cosTable(k)(idx))
+    res.im := Mux(mode, sinTable2(k)(idx), sinTable(k)(idx))
+    res
+  }
+
+  def timesInvn(a: MyComplex): MyComplex = {
+    val b = Wire(new MyComplex)
+    b.re := a.re >> stages
+    b.im := a.im >> stages
+    b
+  }
+
+  // R2DIF流水线计数器（与R2MDC类似）
+  val maxCount = (FFTLength * 3 / 2 - 1).asUInt()
+  val cnt = RegInit(0.U((stages + 1).W))
+  val busy = cnt =/= 0.U
+  when(io.din_valid || busy){
+    cnt := Mux(cnt === maxCount, 0.U, cnt + 1.U)
+  }
+  io.busy := busy
+
+  // R2DIF流水线数据路径（参考R2MDC结构，但使用DIF蝶形）
+  val out1 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  val out2 = VecInit(Seq.fill(stages + 1)(0.S((2 * DataWidth).W).asTypeOf(new MyComplex)))
+  out1(0) := io.dIn
+  out2(0) := io.dIn
+
+  switch(state) {
+    is(sInput) {
+      when(io.din_valid) {
+        inputBuffer.write(inputCnt, io.dIn)
+        inputCnt := inputCnt + 1.U
+        when(inputCnt === (FFTLength - 1).U) {
+          state := sProcess
+          inputCnt := 0.U
+          initCnt := 0.U  // 开始初始化bufferA
+          // pipelineWarmupCnt在第1次迭代特殊处理中使用
+        }
+      }
+    }
+    is(sProcess) {
+      // 批处理FFT计算，完成后进入输出状态
+    }
+    is(sOutput) {
+      // 输出完成后回到输入状态
+    }
+  }
+
+  // 流水线化的FFT处理
+  val currentStage = RegInit(0.U(log2Ceil(stages + 5).W))  // 增加等待状态，支持第1次迭代额外等待
+  val butterflyCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
+
+  // **第1次迭代标志**
+  val isFirstIteration = RegInit(true.B)
+
+  // **关键改进1: 流水线寄存器**
+  // 第1级流水线：地址计算
+  val addrValid = RegInit(false.B)
+  val upperAddrReg = RegInit(0.U(log2Ceil(FFTLength).W))
+  val lowerAddrReg = RegInit(0.U(log2Ceil(FFTLength).W))
+  val wnIdxReg = RegInit(0.U(log2Ceil(FFTLength).W))
+  val stageReg = RegInit(0.U(log2Ceil(stages).W))
+  val isEvenStageReg = RegInit(false.B)
+
+  // 第2级流水线：数据读取
+  val dataValid = RegInit(false.B)
+  val upperDataReg = Reg(new MyComplex)
+  val lowerDataReg = Reg(new MyComplex)
+  val wnReg = Reg(new MyComplex)
+  val upperAddrReg2 = RegInit(0.U(log2Ceil(FFTLength).W))
+  val lowerAddrReg2 = RegInit(0.U(log2Ceil(FFTLength).W))
+  val isEvenStageReg2 = RegInit(false.B)
+
+  // 第3级流水线：蝶形计算
+  val calcValid = RegInit(false.B)
+  val bfOut1Reg = Reg(new MyComplex)
+  val bfOut2Reg = Reg(new MyComplex)
+  val upperAddrReg3 = RegInit(0.U(log2Ceil(FFTLength).W))
+  val lowerAddrReg3 = RegInit(0.U(log2Ceil(FFTLength).W))
+  val isEvenStageReg3 = RegInit(false.B)
+
+  val busy = state === sProcess || state === sBufferInit
+  io.busy := busy
+
+  // **方案1修复：状态转换时清空流水线**
+  when(state =/= sProcess) {
+    addrValid := false.B
+    dataValid := false.B
+    calcValid := false.B
+  }
+
+  // **关键改进2: 简化地址计算**
+  // 使用移位和掩码代替除法和取模
+  def getBlockIdx(cnt: UInt, stage: UInt): UInt = {
+    val shift = (stages.U - stage - 1.U)
+    cnt >> shift
+  }
+
+  def getInBlockIdx(cnt: UInt, stage: UInt): UInt = {
+    val mask = (1.U << (stages.U - stage - 1.U)) - 1.U
+    cnt & mask
+  }
+
+  // 流水线化的FFT处理逻辑
+  when(state === sProcess) {
+    when(currentStage === 0.U && initCnt < FFTLength.U) {
+      // **关键修复：同时清空bufferA和bufferB，防止残留数据污染**
+      val zeroComplex = Wire(new MyComplex)
+      zeroComplex.re := FixedPoint.fromDouble(0.0, DataWidth.W, BinaryPoint.BP)
+      zeroComplex.im := FixedPoint.fromDouble(0.0, DataWidth.W, BinaryPoint.BP)
+
+      // 从inputBuffer读取数据并写入bufferA
+      bufferA.write(initCnt, inputBuffer.read(initCnt))
+      // 清空bufferB对应位置
+      bufferB.write(initCnt, zeroComplex)
+
+      initCnt := initCnt + 1.U
+      // 清空流水线
+      addrValid := false.B
+      dataValid := false.B
+      calcValid := false.B
+    }.otherwise {
+      // **第1级流水线：地址计算**
+      when(currentStage < stages.U) {
+        val blockIdx = getBlockIdx(butterflyCnt, currentStage)
+        val inBlockIdx = getInBlockIdx(butterflyCnt, currentStage)
+        val blockSize = 1.U << (stages.U - currentStage)
+
+        upperAddrReg := blockIdx * blockSize + inBlockIdx
+        lowerAddrReg := blockIdx * blockSize + inBlockIdx + (blockSize >> 1)
+        wnIdxReg := inBlockIdx
+        stageReg := currentStage
+        isEvenStageReg := (currentStage & 1.U) === 0.U
+        addrValid := true.B
+      }
+
+      // **第2级流水线：数据读取（使用寄存器的地址）**
+      when(addrValid) {
+        // 根据stage奇偶性选择buffer
+        when(isEvenStageReg) {
+          upperDataReg := bufferA.read(upperAddrReg)
+          lowerDataReg := bufferA.read(lowerAddrReg)
+        }.otherwise {
+          upperDataReg := bufferB.read(upperAddrReg)
+          lowerDataReg := bufferB.read(lowerAddrReg)
+        }
+
+        // 读取旋转因子（根据stageReg选择正确的表）
+        val wn = Wire(new MyComplex)
+        // 使用MuxLookup选择正确的旋转因子表
+        val wnRe = MuxLookup(stageReg, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
+          (0 until stages).map(s => s.U -> Mux(mode, difCosTable2(s)(wnIdxReg), difCosTable(s)(wnIdxReg))))
+        val wnIm = MuxLookup(stageReg, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
+          (0 until stages).map(s => s.U -> Mux(mode, difSinTable2(s)(wnIdxReg), difSinTable(s)(wnIdxReg))))
+        wn.re := wnRe
+        wn.im := wnIm
+        wnReg := wn
+
+        upperAddrReg2 := upperAddrReg
+        lowerAddrReg2 := lowerAddrReg
+        isEvenStageReg2 := isEvenStageReg
+        dataValid := addrValid
+      }
+
+      // **第3级流水线：蝶形计算**
+      when(dataValid) {
+        // DIF蝶形运算
+        val addResult = ComplexAdd(upperDataReg, lowerDataReg)
+        val subResult = ComplexSub(upperDataReg, lowerDataReg)
+        val mulResult = ComplexMul(subResult, wnReg)
+
+        bfOut1Reg := addResult
+        bfOut2Reg := mulResult
+        upperAddrReg3 := upperAddrReg2
+        lowerAddrReg3 := lowerAddrReg2
+        isEvenStageReg3 := isEvenStageReg2
+        calcValid := dataValid
+      }
+
+      // **第4级：写回**
+      when(calcValid) {
+        // 根据stage奇偶性写入到正确的buffer
+        when(isEvenStageReg3) {
+          // 偶数stage：从A读，写到B
+          bufferB.write(upperAddrReg3, bfOut1Reg)
+          bufferB.write(lowerAddrReg3, bfOut2Reg)
+        }.otherwise {
+          // 奇数stage：从B读，写到A
+          bufferA.write(upperAddrReg3, bfOut1Reg)
+          bufferA.write(lowerAddrReg3, bfOut2Reg)
+        }
+      }
+
+      // 更新计数器
+      when(currentStage < stages.U) {
+        butterflyCnt := butterflyCnt + 1.U
+        when(butterflyCnt === ((FFTLength / 2) - 1).U) {
+          butterflyCnt := 0.U
+          currentStage := currentStage + 1.U
+          // **方案1修复：清空流水线，准备下一个stage**
+          addrValid := false.B
+          dataValid := false.B
+          calcValid := false.B
+        }
+      }.elsewhen(currentStage === stages.U) {
+        // **方案2修复：等待流水线清空 - 第1个周期**
+        currentStage := stages.U + 1.U
+      }.elsewhen(currentStage === (stages.U + 1.U)) {
+        // 等待流水线清空 - 第2个周期
+        currentStage := stages.U + 2.U
+      }.elsewhen(currentStage === (stages.U + 2.U)) {
+        // 等待流水线清空 - 第3个周期
+        when(isFirstIteration) {
+          // **第1次迭代：额外等待2个周期**
+          currentStage := stages.U + 3.U
+        }.otherwise {
+          currentStage := 0.U
+          state := sOutput
+        }
+      }.elsewhen(currentStage === (stages.U + 3.U)) {
+        // 第1次迭代额外等待 - 第4个周期
+        currentStage := stages.U + 4.U
+      }.elsewhen(currentStage === (stages.U + 4.U)) {
+        // 第1次迭代额外等待 - 第5个周期，确保流水线完全清空
+        currentStage := 0.U
+        state := sOutput
+      }
+    }
+  }
+
+  // 输出逻辑：在sOutput状态读取最终的FFT结果
+  val outputCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
+
+  when(state === sOutput) {
+    outputCnt := outputCnt + 2.U
+    when(outputCnt >= (FFTLength - 2).U) {
+      outputCnt := 0.U
+      state := sInput
+      // 第1次迭代完成后清除标志
+      when(isFirstIteration) {
+        isFirstIteration := false.B
+      }
+    }
+  }
+
+  // 确定最终结果在哪个buffer（stages是奇数，结果在bufferB）
+  val finalBuffer = if (stages % 2 == 1) bufferB else bufferA
+
+  // DIF算法的输出顺序：我们的实现已经产生了自然顺序输出
+  // （因为每个stage内的蝶形按顺序排列）
+  val outputData1 = finalBuffer.read(outputCnt)
+  val outputData2 = finalBuffer.read(outputCnt + 1.U)
+
+  val scaledData1 = Mux(mode, timesInvn(outputData1), outputData1)
+  val scaledData2 = Mux(mode, timesInvn(outputData2), outputData2)
+
+  io.dOut1 := Mux(state === sOutput, scaledData1, 0.S.asTypeOf(new MyComplex))
+  io.dOut2 := Mux(state === sOutput, scaledData2, 0.S.asTypeOf(new MyComplex))
+  io.dout_valid := state === sOutput
+}

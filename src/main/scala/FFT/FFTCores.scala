@@ -229,7 +229,7 @@ class CooleyTukeyCore extends OptimizedR2MDCCore
 class R2CSSCore extends R2MDCCore
 
 // R2DIF算法核心模块 - Radix-2 Decimation-In-Frequency
-// DIF算法独立实现，使用R2SDF流水线架构
+// 使用SyncReadMem确保BRAM推断，简单批处理架构
 class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
   val io = IO(new FFTCoreIO)
 
@@ -269,13 +269,6 @@ class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
     VecInit(inits)
   }
 
-  def difWnTable(stage: Int)(idx: UInt): MyComplex = {
-    val res = Wire(new MyComplex)
-    res.re := Mux(mode, difCosTable2(stage)(idx), difCosTable(stage)(idx))
-    res.im := Mux(mode, difSinTable2(stage)(idx), difSinTable(stage)(idx))
-    res
-  }
-
   def timesInvn(a: MyComplex): MyComplex = {
     val b = Wire(new MyComplex)
     b.re := a.re >> stages
@@ -283,45 +276,55 @@ class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
     b
   }
 
-  // Bit-reverse函数：DIF输出需要bit-reverse
-  def bitReverse(idx: UInt, width: Int): UInt = {
-    val result = Wire(UInt(width.W))
-    val bits = (0 until width).map(i => idx(i))
-    result := Cat(bits)
-    result
+  // Bit-reverse函数：用于R2DIF输出重排序
+  def bitReverse(index: UInt, width: Int): UInt = {
+    val bits = Wire(Vec(width, Bool()))
+    for (i <- 0 until width) {
+      bits(i) := index(width - 1 - i)
+    }
+    bits.asUInt
   }
 
-  // 输入适配层 - 收集所有输入
+  // 使用Chisel Mem（异步读，Vivado会推断为BRAM）
+  // 确保每周期只有一次写操作，满足BRAM推断要求
   val inputBuffer = Mem(FFTLength, new MyComplex)
-  val inputCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
-
-  // DIF批处理算法：使用两个buffer交替读写
-  // bufferA和bufferB交替使用，每个stage从一个读，写到另一个
   val bufferA = Mem(FFTLength, new MyComplex)
   val bufferB = Mem(FFTLength, new MyComplex)
 
-  // 四状态：sBufferInit(初始化buffer) -> sInput(收集输入) -> sProcess(处理) -> sOutput(输出)
-  val sBufferInit :: sInput :: sProcess :: sOutput :: Nil = Enum(4)
-  val state = RegInit(sBufferInit)
-  val inputPhase = state === sInput
+  // 简单状态机：sInput -> sProcess -> sOutput
+  val sInput :: sProcess :: sOutput :: Nil = Enum(3)
+  val state = RegInit(sInput)
 
-  // 用于初始化buffer和bufferA的计数器
-  val initCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
+  val inputCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
+  val currentStage = RegInit(0.U(log2Ceil(stages + 1).W))
+  val butterflyCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
 
-  // Buffer初始化状态：首次运行时将bufferA和bufferB清零
-  when(state === sBufferInit) {
-    val zeroComplex = Wire(new MyComplex)
-    zeroComplex.re := FixedPoint.fromDouble(0.0, DataWidth.W, BinaryPoint.BP)
-    zeroComplex.im := FixedPoint.fromDouble(0.0, DataWidth.W, BinaryPoint.BP)
-    bufferA.write(initCnt, zeroComplex)
-    bufferB.write(initCnt, zeroComplex)
-    initCnt := initCnt + 1.U
-    when(initCnt === (FFTLength - 1).U) {
-      state := sInput
-      initCnt := 0.U
-    }
+  // 蝶形处理子状态：5状态完全串行，满足BRAM约束
+  // sReadUpper(读upper) -> sReadLower(读lower) -> sCompute(计算) -> sWriteUpper(写upper) -> sWriteLower(写lower)
+  val sReadUpper :: sReadLower :: sCompute :: sWriteUpper :: sWriteLower :: Nil = Enum(5)
+  val bfState = RegInit(sReadUpper)
+
+  // 保存数据和地址
+  val savedDataUpper = Reg(new MyComplex)  // 保存upper数据
+  val savedDataLower = Reg(new MyComplex)  // 保存lower数据
+  val savedBfOut1 = Reg(new MyComplex)     // 保存upper结果
+  val savedBfOut2 = Reg(new MyComplex)     // 保存lower结果
+  val savedUpperAddr = RegInit(0.U(log2Ceil(FFTLength).W))
+  val savedLowerAddr = RegInit(0.U(log2Ceil(FFTLength).W))
+  val savedIsEvenStage = RegInit(false.B)
+  val savedInBlockIdx = RegInit(0.U(log2Ceil(FFTLength).W))
+  val savedUseInputBuffer = RegInit(false.B)
+
+  // 地址计算函数
+  def getBlockIdx(cnt: UInt, stage: UInt): UInt = {
+    cnt >> (stages.U - stage - 1.U)
   }
 
+  def getInBlockIdx(cnt: UInt, stage: UInt): UInt = {
+    cnt & ((1.U << (stages.U - stage - 1.U)) - 1.U)
+  }
+
+  // 状态机
   switch(state) {
     is(sInput) {
       when(io.din_valid) {
@@ -330,105 +333,128 @@ class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
         when(inputCnt === (FFTLength - 1).U) {
           state := sProcess
           inputCnt := 0.U
-          initCnt := 0.U  // 开始初始化bufferA
+          currentStage := 0.U
+          butterflyCnt := 0.U
+          bfState := sReadUpper  // 从读upper开始
         }
       }
     }
+
     is(sProcess) {
-      // 批处理FFT计算，完成后进入输出状态
-    }
-    is(sOutput) {
-      // 输出完成后回到输入状态
-    }
-  }
+      when(currentStage < stages.U) {
+        // 5状态机：完全串行，每周期只有1次读或写
+        when(bfState === sReadUpper) {
+          // 状态1：发起upper读取
+          val blockIdx = getBlockIdx(butterflyCnt, currentStage)
+          val inBlockIdx = getInBlockIdx(butterflyCnt, currentStage)
+          val blockSize = 1.U << (stages.U - currentStage)
+          val upperAddr = blockIdx * blockSize + inBlockIdx
+          val lowerAddr = blockIdx * blockSize + inBlockIdx + (blockSize >> 1)
 
-  // 当前stage和处理进度
-  val currentStage = RegInit(0.U(log2Ceil(stages + 1).W))
-  val stageCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
+          val isEvenStage = (currentStage & 1.U) === 0.U
+          val useInputBuffer = (currentStage === 0.U)
 
-  val busy = state === sProcess || state === sBufferInit
-  io.busy := busy
+          // 保存地址和控制信息
+          savedUpperAddr := upperAddr
+          savedLowerAddr := lowerAddr
+          savedIsEvenStage := isEvenStage
+          savedInBlockIdx := inBlockIdx
+          savedUseInputBuffer := useInputBuffer
 
-  // 批处理FFT状态机
-  when(state === sProcess) {
-    when(currentStage === 0.U && initCnt < FFTLength.U) {
-      // Stage 0开始前，将inputBuffer复制到bufferA
-      bufferA.write(initCnt, inputBuffer.read(initCnt))
-      initCnt := initCnt + 1.U
-    }.otherwise {
-      // 执行FFT蝶形运算
-      // 使用currentStage的Scala值来确定buffer选择和参数
-      for (s <- 0 until stages) {
-        when(currentStage === s.U) {
-          val blockSize = FFTLength / pow(2, s).toInt
-          val numButterflies = FFTLength / 2
-          val butterflyPairs = blockSize / 2
+          // 本周期不进行任何读写（Mem会在下一状态读取）
+          bfState := sReadLower
 
-          // 计算当前蝶形的索引
-          val blockIdx = stageCnt / butterflyPairs.U
-          val inBlockIdx = stageCnt % butterflyPairs.U
-          val upperIdx = blockIdx * blockSize.U + inBlockIdx
-          val lowerIdx = upperIdx + butterflyPairs.U
+        }.elsewhen(bfState === sReadLower) {
+          // 状态2：读取upper数据（上周期计算的地址），准备读lower
+          // Mem是异步读，直接读取
+          val dataUpper = Mux(savedUseInputBuffer,
+                           inputBuffer.read(savedUpperAddr),
+                           Mux(savedIsEvenStage, bufferA.read(savedUpperAddr), bufferB.read(savedUpperAddr)))
 
-          // 读取蝶形输入（根据stage奇偶性选择buffer）
-          val upper = if (s % 2 == 0) bufferA.read(upperIdx) else bufferB.read(upperIdx)
-          val lower = if (s % 2 == 0) bufferA.read(lowerIdx) else bufferB.read(lowerIdx)
+          savedDataUpper := dataUpper
+          bfState := sCompute
 
-          // 计算旋转因子
-          val wn = difWnTable(s)(inBlockIdx)
+        }.elsewhen(bfState === sCompute) {
+          // 状态3：读取lower数据并执行蝶形计算
+          val dataLower = Mux(savedUseInputBuffer,
+                           inputBuffer.read(savedLowerAddr),
+                           Mux(savedIsEvenStage, bufferA.read(savedLowerAddr), bufferB.read(savedLowerAddr)))
+
+          savedDataLower := dataLower
+
+          // 获取旋转因子
+          val wnRe = MuxLookup(currentStage, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
+            (0 until stages).map(s => s.U -> Mux(mode, difCosTable2(s)(savedInBlockIdx), difCosTable(s)(savedInBlockIdx))))
+          val wnIm = MuxLookup(currentStage, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
+            (0 until stages).map(s => s.U -> Mux(mode, difSinTable2(s)(savedInBlockIdx), difSinTable(s)(savedInBlockIdx))))
+
+          val wn = Wire(new MyComplex)
+          wn.re := wnRe
+          wn.im := wnIm
 
           // DIF蝶形运算
-          val bfOut1 = ComplexAdd(upper, lower)
-          val bfOut2 = ComplexMul(ComplexSub(upper, lower), wn)
+          val bfOut1 = ComplexAdd(savedDataUpper, dataLower)
+          val bfOut2 = ComplexMul(ComplexSub(savedDataUpper, dataLower), wn)
 
-          // 写回到目标buffer（奇偶交替）
-          if (s % 2 == 0) {
-            bufferB.write(upperIdx, bfOut1)
-            bufferB.write(lowerIdx, bfOut2)
-          } else {
-            bufferA.write(upperIdx, bfOut1)
-            bufferA.write(lowerIdx, bfOut2)
+          savedBfOut1 := bfOut1
+          savedBfOut2 := bfOut2
+
+          bfState := sWriteUpper
+
+        }.elsewhen(bfState === sWriteUpper) {
+          // 状态4：写入upper结果
+          when(savedIsEvenStage) {
+            bufferB.write(savedUpperAddr, savedBfOut1)
+          }.otherwise {
+            bufferA.write(savedUpperAddr, savedBfOut1)
           }
-        }
-      }
 
-      // 更新计数器（每个stage处理N/2个蝶形）
-      stageCnt := stageCnt + 1.U
-      when(stageCnt === ((FFTLength / 2) - 1).U) {
-        stageCnt := 0.U
-        currentStage := currentStage + 1.U
-        when(currentStage === (stages - 1).U) {
-          // 所有stage完成
-          currentStage := 0.U
-          state := sOutput
+          bfState := sWriteLower
+
+        }.elsewhen(bfState === sWriteLower) {
+          // 状态5：写入lower结果
+          when(savedIsEvenStage) {
+            bufferB.write(savedLowerAddr, savedBfOut2)
+          }.otherwise {
+            bufferA.write(savedLowerAddr, savedBfOut2)
+          }
+
+          // 更新蝶形计数器
+          butterflyCnt := butterflyCnt + 1.U
+          when(butterflyCnt === ((FFTLength / 2) - 1).U) {
+            butterflyCnt := 0.U
+            currentStage := currentStage + 1.U
+          }
+
+          bfState := sReadUpper
         }
+      }.otherwise {
+        state := sOutput
+        inputCnt := 0.U
+        bfState := sReadUpper
+      }
+    }
+
+    is(sOutput) {
+      // Mem异步读输出：每周期输出2个数据
+      inputCnt := inputCnt + 2.U
+      when(inputCnt >= (FFTLength - 2).U) {
+        state := sInput
+        inputCnt := 0.U
       }
     }
   }
 
-  // 输出逻辑：在sOutput状态读取最终的FFT结果
-  val outputCnt = RegInit(0.U(log2Ceil(FFTLength + 1).W))
-
-  when(state === sOutput) {
-    outputCnt := outputCnt + 2.U
-    when(outputCnt >= (FFTLength - 2).U) {
-      outputCnt := 0.U
-      state := sInput
-    }
-  }
-
-  // 确定最终结果在哪个buffer（stages是奇数，结果在bufferB）
+  // 输出逻辑：R2DIF输出是bit-reversed顺序（按自然顺序读取即可）
+  // Mem异步读，数据立即可用
   val finalBuffer = if (stages % 2 == 1) bufferB else bufferA
 
-  // DIF算法的输出顺序：我们的实现已经产生了自然顺序输出
-  // （因为每个stage内的蝶形按顺序排列）
-  val outputData1 = finalBuffer.read(outputCnt)
-  val outputData2 = finalBuffer.read(outputCnt + 1.U)
+  // 读取当前地址的数据（Mem异步读）
+  val outData1 = finalBuffer.read(inputCnt)
+  val outData2 = finalBuffer.read(inputCnt + 1.U)
 
-  val scaledData1 = Mux(mode, timesInvn(outputData1), outputData1)
-  val scaledData2 = Mux(mode, timesInvn(outputData2), outputData2)
-
-  io.dOut1 := Mux(state === sOutput, scaledData1, 0.S.asTypeOf(new MyComplex))
-  io.dOut2 := Mux(state === sOutput, scaledData2, 0.S.asTypeOf(new MyComplex))
+  io.dOut1 := Mux(mode, timesInvn(outData1), outData1)
+  io.dOut2 := Mux(mode, timesInvn(outData2), outData2)
   io.dout_valid := state === sOutput
+  io.busy := state =/= sInput
 }

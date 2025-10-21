@@ -36,6 +36,16 @@ class FFT extends Module
       val optimizedCore = Module(new OptimizedR2MDCCore())
       optimizedCore.io <> io
     }
+    case FFTAlgorithm.R2CSS => {
+      println("[DEBUG] Instantiating R2CSS (R2CSSCore)")
+      val r2cssCore = Module(new R2CSSCore())
+      r2cssCore.io <> io
+    }
+    case FFTAlgorithm.R2DIF => {
+      println("[DEBUG] Instantiating R2DIF (R2DIFCore)")
+      val r2difCore = Module(new R2DIFCore())
+      r2difCore.io <> io
+    }
     case _ => {
       println("[DEBUG] Unknown algorithm, falling back to R2MDC")
       val r2mdcCore = Module(new R2MDCCore())

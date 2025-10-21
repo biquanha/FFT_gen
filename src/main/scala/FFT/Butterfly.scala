@@ -54,9 +54,27 @@ class ComplexMul extends Module
     io.res.re := k1 - k3
     io.res.im := k1 + k2
   } else {
+    // 为提高时序性能，可以选择添加流水线寄存器
+    // 当前保持单周期实现以兼容现有测试
     io.res.re := io.op1.re * io.op2.re - io.op1.im * io.op2.im
     io.res.im := io.op1.re * io.op2.im + io.op1.im * io.op2.re
   }
+}
+
+// 流水线化的复数乘法器（可选，用于高频设计）
+class ComplexMulPipelined extends Module
+  with HasElaborateConfig {
+  val io = IO(new ComplexOperationIO)
+
+  // 第1级：计算4个乘积
+  val mult_rr = RegNext(io.op1.re * io.op2.re)
+  val mult_ii = RegNext(io.op1.im * io.op2.im)
+  val mult_ri = RegNext(io.op1.re * io.op2.im)
+  val mult_ir = RegNext(io.op1.im * io.op2.re)
+
+  // 第2级：计算最终结果
+  io.res.re := mult_rr - mult_ii
+  io.res.im := mult_ri + mult_ir
 }
 object ComplexMul {
   def apply(op1: MyComplex, op2: MyComplex):MyComplex = {
@@ -111,6 +129,31 @@ object Switch {
     inst.io.in1 := in1
     inst.io.in2 := in2
     inst.io.sel := sel
+    (inst.io.out1, inst.io.out2)
+  }
+}
+
+// DIF蝶形单元 - Decimation-In-Frequency
+// DIF蝶形的数学公式：
+// out1 = in1 + in2
+// out2 = (in1 - in2) * wn
+class ButterflyDIF extends Module {
+  val io = IO(new ButterflyIO())
+
+  val add_result = ComplexAdd(io.in1, io.in2)
+  val sub_result = ComplexSub(io.in1, io.in2)
+  val mul_result = ComplexMul(sub_result, io.wn)
+
+  io.out1 := add_result
+  io.out2 := mul_result
+}
+
+object ButterflyDIF {
+  def apply(in1: MyComplex, in2: MyComplex, wn: MyComplex): (MyComplex, MyComplex) = {
+    val inst = Module(new ButterflyDIF)
+    inst.io.in1 := in1
+    inst.io.in2 := in2
+    inst.io.wn := wn
     (inst.io.out1, inst.io.out2)
   }
 }

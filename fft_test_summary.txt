@@ -1,11 +1,11 @@
 FFT测试配置: FFT_LENGTH=512, BINARY_POINT=30, ITER_NUM=5
 输入信号类型: 正弦波 (周期256点, 虚部恒为0)
-测试开始时间: 2025-09-28T00:13:41.655911
-Iteration 1: Error=0.6977189308271373%, Overflow=115
-Iteration 2: Error=0.6977189308271373%, Overflow=115
-Iteration 3: Error=0.6977189308271373%, Overflow=115
-Iteration 4: Error=0.6977189308271373%, Overflow=115
-Iteration 5: Error=0.6977189308271373%, Overflow=115
+测试开始时间: 2025-10-21T21:43:29.779278
+Iteration 1: Error=6.742206479568711E-8%, Overflow=0
+Iteration 2: Error=6.742206479568711E-8%, Overflow=0
+Iteration 3: Error=6.742206479568711E-8%, Overflow=0
+Iteration 4: Error=6.742206479568711E-8%, Overflow=0
+Iteration 5: Error=6.742206479568711E-8%, Overflow=0
 
-测试完成: 平均错误率=0.6977189308271373%, 总溢出=575
-测试结束时间: 2025-09-28T00:14:04.359437
+测试完成: 平均错误率=6.742206479568711E-8%, 总溢出=0
+测试结束时间: 2025-10-21T21:43:47.798834

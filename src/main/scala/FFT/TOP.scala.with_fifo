@@ -33,16 +33,20 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
   // 创建虚拟的DecoupledIO接口用于内部FFT连接
   val din = Wire(Flipped(DecoupledIO(new MyComplex)))
   val dout = Wire(DecoupledIO(new MyComplex))
-
-  // FFT连接逻辑（移除FIFO，直接连接以节省8KB内存）
+  
+  // 完全保持原始的FFT连接逻辑
   val FFT = Module(new FFTReorder)
-
-  // 直接连接FFT输出到dout（无需FIFO缓冲，outputMem已提供缓冲）
-  din.ready := dout.ready && !FFT.io.busy
+  val FIFOcmd = Wire(DecoupledIO(new MyComplex))
+  FIFOcmd.valid := FFT.io.dout_valid
+  FIFOcmd.bits := FFT.io.dOut
+  val FIFO = Queue(FIFOcmd, 2 * FFTLength)
+  
+  FIFO.ready := dout.ready
+  din.ready := FIFOcmd.ready && !FFT.io.busy
   FFT.io.din_valid := din.fire()
   FFT.io.dIn := din.bits
-  dout.valid := FFT.io.dout_valid
-  dout.bits := FFT.io.dOut
+  dout.valid := FIFO.fire()
+  dout.bits := FIFO.bits
   
   // 四阶段状态机：INIT -> INPUT -> PROCESSING -> OUTPUT
   val sInit :: sInput :: sProcessing :: sOutput :: Nil = Enum(4)
