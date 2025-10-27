@@ -4,10 +4,9 @@ package FFT
 import chisel3._
 import chisel3.experimental._
 
-class MyComplex extends Bundle
-  with HasDataConfig {
-  val re = FixedPoint(DataWidth.W, BinaryPoint.BP)
-  val im = FixedPoint(DataWidth.W, BinaryPoint.BP)
+class MyComplex extends Bundle with HasDataConfig {
+  val re = SInt(DataWidth.W)
+  val im = SInt(DataWidth.W)
 }
 
 class ComplexOperationIO extends Bundle {
@@ -44,37 +43,44 @@ object ComplexSub {
   }
 }
 
-class ComplexMul extends Module
-  with HasElaborateConfig {
+class ComplexMul extends Module with HasElaborateConfig with HasDataConfig {
   val io = IO(new ComplexOperationIO)
+  // 定点Q格式乘法：结果右移BinaryPoint位
+  def qmul(a: SInt, b: SInt): SInt = {
+    val prod = (a * b).asSInt
+    (prod >> BinaryPoint).asSInt
+  }
   if (useGauss) {
-    val k1 = io.op2.re * (io.op1.re + io.op1.im)
-    val k2 = io.op1.re * (io.op2.im - io.op2.re)
-    val k3 = io.op1.im * (io.op2.re + io.op2.im)
-    io.res.re := k1 - k3
-    io.res.im := k1 + k2
+    val k1 = qmul(io.op2.re, (io.op1.re + io.op1.im).asSInt)
+    val k2 = qmul(io.op1.re, (io.op2.im - io.op2.re).asSInt)
+    val k3 = qmul(io.op1.im, (io.op2.re + io.op2.im).asSInt)
+    io.res.re := (k1 - k3).asSInt
+    io.res.im := (k1 + k2).asSInt
   } else {
-    // 为提高时序性能，可以选择添加流水线寄存器
-    // 当前保持单周期实现以兼容现有测试
-    io.res.re := io.op1.re * io.op2.re - io.op1.im * io.op2.im
-    io.res.im := io.op1.re * io.op2.im + io.op1.im * io.op2.re
+    // 单周期实现
+    val rr = qmul(io.op1.re, io.op2.re)
+    val ii = qmul(io.op1.im, io.op2.im)
+    val ri = qmul(io.op1.re, io.op2.im)
+    val ir = qmul(io.op1.im, io.op2.re)
+    io.res.re := (rr - ii).asSInt
+    io.res.im := (ri + ir).asSInt
   }
 }
 
 // 流水线化的复数乘法器（可选，用于高频设计）
 class ComplexMulPipelined extends Module
-  with HasElaborateConfig {
+  with HasElaborateConfig with HasDataConfig {
   val io = IO(new ComplexOperationIO)
 
   // 第1级：计算4个乘积
-  val mult_rr = RegNext(io.op1.re * io.op2.re)
-  val mult_ii = RegNext(io.op1.im * io.op2.im)
-  val mult_ri = RegNext(io.op1.re * io.op2.im)
-  val mult_ir = RegNext(io.op1.im * io.op2.re)
+  val mult_rr = RegNext((io.op1.re * io.op2.re).asSInt)
+  val mult_ii = RegNext((io.op1.im * io.op2.im).asSInt)
+  val mult_ri = RegNext((io.op1.re * io.op2.im).asSInt)
+  val mult_ir = RegNext((io.op1.im * io.op2.re).asSInt)
 
   // 第2级：计算最终结果
-  io.res.re := mult_rr - mult_ii
-  io.res.im := mult_ri + mult_ir
+  io.res.re := ((mult_rr - mult_ii).asSInt >> BinaryPoint).asSInt
+  io.res.im := ((mult_ri + mult_ir).asSInt >> BinaryPoint).asSInt
 }
 object ComplexMul {
   def apply(op1: MyComplex, op2: MyComplex):MyComplex = {

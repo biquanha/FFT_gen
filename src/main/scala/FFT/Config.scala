@@ -1,7 +1,5 @@
 package FFT
 
-import org.scalacheck.Prop
-
 trait HasDataConfig {
   val DataWidth = 32
   val BinaryPoint = 30  // 使用30位，避免溢出同时保持高精度
@@ -18,9 +16,20 @@ object FFTAlgorithm extends Enumeration {
 }
 
 trait HasElaborateConfig {
-  val FFTLength = 512
-  val useGauss = false
-  val supportIFFT = false
-  // FFT算法选择，默认为R2DIF
-  val fftAlgorithm = FFTAlgorithm.R2DIF
+  // 允许通过系统属性覆盖：-DFFT_LEN=512 -DFFT_ALGO=R2DIF|R2MDC|R2MDC_Optimized|R2CSS -DSUPPORT_IFFT=true
+  private def prop(name: String, default: String) = scala.sys.props.getOrElse(name, default)
+
+  val FFTLength: Int = prop("FFT_LEN", "512").toInt
+  val useGauss: Boolean = prop("USE_GAUSS", "false").toBoolean
+  val supportIFFT: Boolean = prop("SUPPORT_IFFT", "false").toBoolean
+
+  val fftAlgorithm: FFTAlgorithm.Value = prop("FFT_ALGO", "R2DIF").toUpperCase match {
+    case "R2MDC"            => FFTAlgorithm.R2MDC
+    case "R2MDC_OPTIMIZED"  => FFTAlgorithm.R2MDC_Optimized
+    case "R2CSS"            => FFTAlgorithm.R2CSS
+    case "R2DIF"            => FFTAlgorithm.R2DIF
+    case other              =>
+      println(s"[WARN] Unknown FFT_ALGO=$other, fallback to R2DIF")
+      FFTAlgorithm.R2DIF
+  }
 }

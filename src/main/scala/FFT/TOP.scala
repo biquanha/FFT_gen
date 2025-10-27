@@ -30,19 +30,26 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
     val axi = new AXI4LiteSlaveBundle(32, 64)
   })
 
+  private val enableHwDebug = sys.props.get("FFT_HW_DEBUG").exists(_.toBoolean)
+  private def hwDebug(body: => Unit): Unit = if (enableHwDebug) body
+
   // 创建虚拟的DecoupledIO接口用于内部FFT连接
   val din = Wire(Flipped(DecoupledIO(new MyComplex)))
   val dout = Wire(DecoupledIO(new MyComplex))
 
-  // FFT连接逻辑（移除FIFO，直接连接以节省8KB内存）
+  // FFT连接逻辑（保留小 FIFO 确保握手稳定）
   val FFT = Module(new FFTReorder)
+  val fifoCmd = Wire(DecoupledIO(new MyComplex))
+  fifoCmd.valid := FFT.io.dout_valid
+  fifoCmd.bits := FFT.io.dOut
+  val fifo = Queue(fifoCmd, 2 * FFTLength)
 
-  // 直接连接FFT输出到dout（无需FIFO缓冲，outputMem已提供缓冲）
-  din.ready := dout.ready && !FFT.io.busy
-  FFT.io.din_valid := din.fire()
+  fifo.ready := dout.ready
+  din.ready := fifoCmd.ready
+  FFT.io.din_valid := din.valid && din.ready
   FFT.io.dIn := din.bits
-  dout.valid := FFT.io.dout_valid
-  dout.bits := FFT.io.dOut
+  dout.valid := fifo.valid
+  dout.bits := fifo.bits
   
   // 四阶段状态机：INIT -> INPUT -> PROCESSING -> OUTPUT
   val sInit :: sInput :: sProcessing :: sOutput :: Nil = Enum(4)
@@ -66,14 +73,16 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
     initCount := initCount + 1.U
     when(initCount === (FFTLength - 1).U) {
       fftState := sInput
-      printf("FFT_PHASE: Initialization complete\n")
+      hwDebug {
+        printf("FFT_PHASE: Initialization complete\n")
+      }
     }
   }
   
   // FFT输入控制 - 严格模拟原始逻辑
   din.valid := false.B
-  din.bits.re := 0.S.asFixedPoint(BinaryPoint.BP)
-  din.bits.im := 0.S.asFixedPoint(BinaryPoint.BP)
+  din.bits.re := 0.S
+  din.bits.im := 0.S
   
   // FFT输出控制 - 等价于原始的dout.ready=1
   dout.ready := true.B
@@ -88,7 +97,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
       when(inputCount === FFTLength.U) {
         fftState := sProcessing
         processCycle := 0.U
-        printf("FFT_PHASE: Input complete, starting processing\n")
+        hwDebug {
+          printf("FFT_PHASE: Input complete, starting processing\n")
+        }
       }
     }
     
@@ -100,29 +111,35 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
       // 只有在inputComplete=false时才允许设置din.valid，防止重复输入
       when(processCycle < FFTLength.U && !inputComplete) {
         val inputData = inputMem(processCycle)
-        din.bits.re := inputData(31, 0).asSInt.asFixedPoint(BinaryPoint.BP)
-        din.bits.im := inputData(63, 32).asSInt.asFixedPoint(BinaryPoint.BP)
+        din.bits.re := inputData(31, 0).asSInt
+        din.bits.im := inputData(63, 32).asSInt
 
         // R2DIF等批量算法需要所有输入都valid，R2MDC只需第一个
         // 为了兼容两种模式，都设置为valid=1
         din.valid := true.B
 
         when(processCycle < 3.U) {
-          printf("FFT_INPUT[%d]: re=%d, im=%d, valid=%d\n",
-                 processCycle, inputData(31, 0).asSInt, inputData(63, 32).asSInt, din.valid)
+          hwDebug {
+            printf("FFT_INPUT[%d]: re=%d, im=%d, valid=%d\n",
+              processCycle, inputData(31, 0).asSInt, inputData(63, 32).asSInt, din.valid)
+          }
         }
 
         // 标记输入完成
         when(processCycle === (FFTLength - 1).U) {
           inputComplete := true.B
-          printf("FFT_PHASE: Input to FFT complete, waiting for output\n")
+          hwDebug {
+            printf("FFT_PHASE: Input to FFT complete, waiting for output\n")
+          }
         }
       }
 
       // 等待FFT输出完成：当outputMem被完全填充时转到sOutput
       when(outputCount === FFTLength.U) {
         fftState := sOutput
-        printf("FFT_PHASE: Processing complete (outputMem filled), ready for output\n")
+        hwDebug {
+          printf("FFT_PHASE: Processing complete (outputMem filled), ready for output\n")
+        }
       }
     }
     
@@ -133,19 +150,23 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
         inputCount := 0.U
         outputCount := 0.U
         readCount := 0.U
-        printf("FFT_PHASE: Output complete, ready for next input\n")
+        hwDebug {
+          printf("FFT_PHASE: Output complete, ready for next input\n")
+        }
       }
     }
   }
   
   // 收集FFT输出数据
-  when(dout.fire()) {
-    val outputData = Cat(dout.bits.im.asSInt.asUInt, dout.bits.re.asSInt.asUInt)
+  when(dout.valid && dout.ready) {
+    val outputData = Cat(dout.bits.im.asUInt, dout.bits.re.asUInt)
     outputMem(outputCount) := outputData
     
     when(outputCount < 3.U) {
-      printf("FFT_OUTPUT[%d]: re=%d, im=%d\n", 
-             outputCount, dout.bits.re.asSInt, dout.bits.im.asSInt)
+      hwDebug {
+        printf("FFT_OUTPUT[%d]: re=%d, im=%d\n",
+          outputCount, dout.bits.re.asSInt, dout.bits.im.asSInt)
+      }
     }
     
     outputCount := outputCount + 1.U
@@ -161,7 +182,7 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
   
   // AXI信号控制：严格按阶段控制，同时等待FFT core就绪
   // sInit阶段拒绝所有AXI请求
-  io.axi.awready := axiState === sIdle && fftState === sInput && inputCount < FFTLength.U && !FFT.io.busy
+  io.axi.awready := axiState === sIdle && fftState === sInput && inputCount < FFTLength.U
   io.axi.wready := axiState === sWrite
   io.axi.bvalid := bvalidReg
   io.axi.bresp := 0.U
@@ -176,10 +197,12 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
       rvalidReg := false.B
 
       // 只在INPUT阶段且FFT不busy时接受写请求
-      when(io.axi.awvalid && io.axi.awready && fftState === sInput && !FFT.io.busy) {
+      when(io.axi.awvalid && io.axi.awready && fftState === sInput) {
         axiState := sWrite
         when(inputCount < 3.U) {
-          printf("AXI_WRITE_REQ[%d] in INPUT phase (FFT ready)\n", inputCount)
+          hwDebug {
+            printf("AXI_WRITE_REQ[%d] in INPUT phase (FFT ready)\n", inputCount)
+          }
         }
       }.elsewhen(io.axi.arvalid && io.axi.arready && fftState === sOutput) {
         // 只在OUTPUT阶段接受读请求
@@ -188,7 +211,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
         rvalidReg := true.B
 
         when(readCount < 3.U) {
-          printf("AXI_READ_REQ[%d] in OUTPUT phase, data=0x%x\n", readCount, outputMem(readCount))
+          hwDebug {
+            printf("AXI_READ_REQ[%d] in OUTPUT phase, data=0x%x\n", readCount, outputMem(readCount))
+          }
         }
       }
     }
@@ -202,7 +227,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
         inputMem(inputCount) := io.axi.wdata
         
         when(inputCount < 3.U) {
-          printf("AXI_WRITE_DATA[%d] = 0x%x\n", inputCount, io.axi.wdata)
+          hwDebug {
+            printf("AXI_WRITE_DATA[%d] = 0x%x\n", inputCount, io.axi.wdata)
+          }
         }
         
         inputCount := inputCount + 1.U
@@ -215,7 +242,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
         rvalidReg := false.B
         
         when(readCount < 3.U) {
-          printf("AXI_READ_COMPLETE[%d]\n", readCount)
+          hwDebug {
+            printf("AXI_READ_COMPLETE[%d]\n", readCount)
+          }
         }
         
         readCount := readCount + 1.U

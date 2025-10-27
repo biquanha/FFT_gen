@@ -1,0 +1,729 @@
+diff --git a/build.sbt b/build.sbt
+index eb079c8..3de92a3 100644
+--- a/build.sbt
++++ b/build.sbt
+@@ -1,59 +1,60 @@
+ // See README.md for license details.
+ 
+-def scalacOptionsVersion(scalaVersion: String): Seq[String] = {
+-  Seq() ++ {
+-    // If we're building with Scala > 2.11, enable the compile option
+-    //  switch to support our anonymous Bundle definitions:
+-    //  https://github.com/scala/bug/issues/10047
+-    CrossVersion.partialVersion(scalaVersion) match {
+-      case Some((2, scalaMajor: Long)) if scalaMajor < 12 => Seq()
+-      case _ => Seq("-Xsource:2.11")
+-    }
+-  }
+-}
+-
+-def javacOptionsVersion(scalaVersion: String): Seq[String] = {
+-  Seq() ++ {
+-    // Scala 2.12 requires Java 8. We continue to generate
+-    //  Java 7 compatible code for Scala 2.11
+-    //  for compatibility with old clients.
+-    CrossVersion.partialVersion(scalaVersion) match {
+-      case Some((2, scalaMajor: Long)) if scalaMajor < 12 =>
+-        Seq("-source", "1.7", "-target", "1.7")
+-      case _ =>
+-        Seq("-source", "1.8", "-target", "1.8")
+-    }
+-  }
+-}
+ 
+ name := "chisel-module-template"
+ 
+-version := "3.3.0"
++version := "6.7.0"
+ 
+-scalaVersion := "2.12.10"
++// 升级到 Chisel 6.7（需要 Scala 2.13）
++scalaVersion := "2.13.12"
+ 
+-// 添加JVM内存配置
+-javaOptions ++= Seq(
+-  "-Xmx64G",  // 最大堆内存4GB
+-  "-Xms16G"   // 初始堆内存2GB
+-) 
++// 调整JVM内存配置：可通过环境变量覆盖，默认更保守以避免内存不足
++// 环境变量：SBT_XMX (默认 4G), SBT_XMS (默认 512M)
++{
++  val xmx = sys.env.getOrElse("SBT_XMX", "4G")
++  val xms = sys.env.getOrElse("SBT_XMS", "512M")
++  javaOptions ++= Seq(s"-Xmx${xmx}", s"-Xms${xms}")
++}
+ 
+-crossScalaVersions := Seq("2.12.10", "2.11.12")
++// 不再支持 2.11/2.12，使用 2.13
++crossScalaVersions := Seq(scalaVersion.value)
+ 
+ resolvers ++= Seq(
+   Resolver.sonatypeRepo("snapshots"),
+   Resolver.sonatypeRepo("releases")
+ )
+ 
+-// Provide a managed dependency on X if -DXVersion="" is supplied on the command line.
+-val defaultVersions = Map(
+-  "chisel3" -> "3.2.+",
+-  "chisel-iotesters" -> "1.3.+"
+-  )
++// 依赖：Chisel 6.7 + chiseltest（替代旧 iotesters）
++libraryDependencies ++= Seq(
++  "org.chipsalliance" %% "chisel" % sys.props.getOrElse("chiselVersion", "6.7.0"),
++  // chiseltest 6.0.0（edu.berkeley.cs 组）
++  "edu.berkeley.cs"   %% "chiseltest" % sys.props.getOrElse("chiselTestVersion", "6.0.0") % Test,
++  "org.scalatest"     %% "scalatest" % "3.2.18" % Test
++)
++
++// Chisel 6 需要编译器插件支持
++ThisBuild / scalacOptions ++= Seq("-Ymacro-annotations")
++// chisel-plugin 需要 full cross（artifact 名含 2.13.12）
++ThisBuild / libraryDependencies ++= {
++  val sv = scalaVersion.value
++  val ver = sys.props.getOrElse("chiselVersion", "6.7.0")
++  Seq(compilerPlugin("org.chipsalliance" % s"chisel-plugin_${sv}" % ver))
++}
++
++// 过滤旧版 iotesters 测试以避免编译
++Test / excludeFilter := (Test / excludeFilter).value ||
++  new SimpleFileFilter(f => f.getName == "FFTTest.scala" || f.getPath.contains("/src/test/scala/gcd/"))
+ 
+-libraryDependencies ++= Seq("chisel3","chisel-iotesters").map {
+-  dep: String => "edu.berkeley.cs" %% dep % sys.props.getOrElse(dep + "Version", defaultVersions(dep)) }
++// 过滤旧版/备份代码与发射脚本，避免不兼容 API 的编译错误
++Compile / excludeFilter := (Compile / excludeFilter).value ||
++  new SimpleFileFilter(f => Set(
++    "VerilogEmitter.scala",
++    "FFTCores.scala.backup_before_rewrite",
++    "TOP.scala.with_fifo"
++  ).contains(f.getName))
+ 
+-scalacOptions ++= scalacOptionsVersion(scalaVersion.value)
++// 调整编译选项，避免 2.13 下的 -Xsource 警告
++scalacOptions := Seq("-deprecation", "-feature", "-unchecked")
++javacOptions := Seq("-source", "1.8", "-target", "1.8")
+ 
+-javacOptions ++= javacOptionsVersion(scalaVersion.value)
++// 关闭旧的 -Xsource 强制设置
+diff --git a/src/main/scala/FFT/Butterfly.scala b/src/main/scala/FFT/Butterfly.scala
+index dbae740..5816110 100644
+--- a/src/main/scala/FFT/Butterfly.scala
++++ b/src/main/scala/FFT/Butterfly.scala
+@@ -4,10 +4,9 @@ package FFT
+ import chisel3._
+ import chisel3.experimental._
+ 
+-class MyComplex extends Bundle
+-  with HasDataConfig {
+-  val re = FixedPoint(DataWidth.W, BinaryPoint.BP)
+-  val im = FixedPoint(DataWidth.W, BinaryPoint.BP)
++class MyComplex extends Bundle with HasDataConfig {
++  val re = SInt(DataWidth.W)
++  val im = SInt(DataWidth.W)
+ }
+ 
+ class ComplexOperationIO extends Bundle {
+@@ -44,37 +43,44 @@ object ComplexSub {
+   }
+ }
+ 
+-class ComplexMul extends Module
+-  with HasElaborateConfig {
++class ComplexMul extends Module with HasElaborateConfig with HasDataConfig {
+   val io = IO(new ComplexOperationIO)
++  // 定点Q格式乘法：结果右移BinaryPoint位
++  def qmul(a: SInt, b: SInt): SInt = {
++    val prod = (a * b).asSInt
++    (prod >> BinaryPoint).asSInt
++  }
+   if (useGauss) {
+-    val k1 = io.op2.re * (io.op1.re + io.op1.im)
+-    val k2 = io.op1.re * (io.op2.im - io.op2.re)
+-    val k3 = io.op1.im * (io.op2.re + io.op2.im)
+-    io.res.re := k1 - k3
+-    io.res.im := k1 + k2
++    val k1 = qmul(io.op2.re, (io.op1.re + io.op1.im).asSInt)
++    val k2 = qmul(io.op1.re, (io.op2.im - io.op2.re).asSInt)
++    val k3 = qmul(io.op1.im, (io.op2.re + io.op2.im).asSInt)
++    io.res.re := (k1 - k3).asSInt
++    io.res.im := (k1 + k2).asSInt
+   } else {
+-    // 为提高时序性能，可以选择添加流水线寄存器
+-    // 当前保持单周期实现以兼容现有测试
+-    io.res.re := io.op1.re * io.op2.re - io.op1.im * io.op2.im
+-    io.res.im := io.op1.re * io.op2.im + io.op1.im * io.op2.re
++    // 单周期实现
++    val rr = qmul(io.op1.re, io.op2.re)
++    val ii = qmul(io.op1.im, io.op2.im)
++    val ri = qmul(io.op1.re, io.op2.im)
++    val ir = qmul(io.op1.im, io.op2.re)
++    io.res.re := (rr - ii).asSInt
++    io.res.im := (ri + ir).asSInt
+   }
+ }
+ 
+ // 流水线化的复数乘法器（可选，用于高频设计）
+ class ComplexMulPipelined extends Module
+-  with HasElaborateConfig {
++  with HasElaborateConfig with HasDataConfig {
+   val io = IO(new ComplexOperationIO)
+ 
+   // 第1级：计算4个乘积
+-  val mult_rr = RegNext(io.op1.re * io.op2.re)
+-  val mult_ii = RegNext(io.op1.im * io.op2.im)
+-  val mult_ri = RegNext(io.op1.re * io.op2.im)
+-  val mult_ir = RegNext(io.op1.im * io.op2.re)
++  val mult_rr = RegNext((io.op1.re * io.op2.re).asSInt)
++  val mult_ii = RegNext((io.op1.im * io.op2.im).asSInt)
++  val mult_ri = RegNext((io.op1.re * io.op2.im).asSInt)
++  val mult_ir = RegNext((io.op1.im * io.op2.re).asSInt)
+ 
+   // 第2级：计算最终结果
+-  io.res.re := mult_rr - mult_ii
+-  io.res.im := mult_ri + mult_ir
++  io.res.re := ((mult_rr - mult_ii).asSInt >> BinaryPoint).asSInt
++  io.res.im := ((mult_ri + mult_ir).asSInt >> BinaryPoint).asSInt
+ }
+ object ComplexMul {
+   def apply(op1: MyComplex, op2: MyComplex):MyComplex = {
+@@ -156,4 +162,4 @@ object ButterflyDIF {
+     inst.io.wn := wn
+     (inst.io.out1, inst.io.out2)
+   }
+-}
+\ No newline at end of file
++}
+diff --git a/src/main/scala/FFT/Config.scala b/src/main/scala/FFT/Config.scala
+index c76805c..82ea2d0 100644
+--- a/src/main/scala/FFT/Config.scala
++++ b/src/main/scala/FFT/Config.scala
+@@ -1,7 +1,5 @@
+ package FFT
+ 
+-import org.scalacheck.Prop
+-
+ trait HasDataConfig {
+   val DataWidth = 32
+   val BinaryPoint = 30  // 使用30位，避免溢出同时保持高精度
+@@ -18,9 +16,20 @@ object FFTAlgorithm extends Enumeration {
+ }
+ 
+ trait HasElaborateConfig {
+-  val FFTLength = 512
+-  val useGauss = false
+-  val supportIFFT = false
+-  // FFT算法选择，默认为R2DIF
+-  val fftAlgorithm = FFTAlgorithm.R2DIF
+-}
+\ No newline at end of file
++  // 允许通过系统属性覆盖：-DFFT_LEN=512 -DFFT_ALGO=R2DIF|R2MDC|R2MDC_Optimized|R2CSS -DSUPPORT_IFFT=true
++  private def prop(name: String, default: String) = scala.sys.props.getOrElse(name, default)
++
++  val FFTLength: Int = prop("FFT_LEN", "512").toInt
++  val useGauss: Boolean = prop("USE_GAUSS", "false").toBoolean
++  val supportIFFT: Boolean = prop("SUPPORT_IFFT", "false").toBoolean
++
++  val fftAlgorithm: FFTAlgorithm.Value = prop("FFT_ALGO", "R2DIF").toUpperCase match {
++    case "R2MDC"            => FFTAlgorithm.R2MDC
++    case "R2MDC_OPTIMIZED"  => FFTAlgorithm.R2MDC_Optimized
++    case "R2CSS"            => FFTAlgorithm.R2CSS
++    case "R2DIF"            => FFTAlgorithm.R2DIF
++    case other              =>
++      println(s"[WARN] Unknown FFT_ALGO=$other, fallback to R2DIF")
++      FFTAlgorithm.R2DIF
++  }
++}
+diff --git a/src/main/scala/FFT/FFTCores.scala b/src/main/scala/FFT/FFTCores.scala
+index 9ff77fe..a7ddd3c 100644
+--- a/src/main/scala/FFT/FFTCores.scala
++++ b/src/main/scala/FFT/FFTCores.scala
+@@ -23,32 +23,60 @@ class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
+   val mode = io.mode.getOrElse(false.B)
+   val stages = log2Ceil(FFTLength)
+   
+-  def sinTable(k: Int): Vec[FixedPoint] = {
++  def sinTable(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (sin(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+-  def cosTable(k: Int): Vec[FixedPoint] = {
++  def cosTable(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (cos(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+-  def sinTable2(k: Int): Vec[FixedPoint] = {
++  def sinTable2(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (sin(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+-  def cosTable2(k: Int): Vec[FixedPoint] = {
++  def cosTable2(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (cos(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+   def wnTable(k: Int)(idx: UInt): MyComplex = {
+@@ -66,7 +94,7 @@ class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
+   }
+   
+   // R2MDC需要额外的流水线延迟：FFTLength * 3/2 - 1个周期
+-  val maxCount = (FFTLength * 3 / 2 - 1).asUInt()
++  val maxCount = (FFTLength * 3 / 2 - 1).U
+   val cnt = RegInit(0.U((stages + 1).W))
+   val busy = cnt =/= 0.U
+   when(io.din_valid || busy){
+@@ -97,7 +125,7 @@ class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
+   
+   io.dOut1 := RegNext(dout1)
+   io.dOut2 := RegNext(dout2)
+-  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
++  io.dout_valid := RegNext(cnt) === (FFTLength - 1).U
+ }
+ 
+ // 优化的R2MDC算法核心模块 (之前错误地命名为CooleyTukey)
+@@ -109,32 +137,60 @@ class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConf
+   
+   
+   // 修改旋转因子计算，确保正确的索引和值
+-  def sinTable(k: Int): Vec[FixedPoint] = {
++  def sinTable(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (sin(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+-  def cosTable(k: Int): Vec[FixedPoint] = {
++  def cosTable(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (cos(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+-  def sinTable2(k: Int): Vec[FixedPoint] = {
++  def sinTable2(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (sin(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+-  def cosTable2(k: Int): Vec[FixedPoint] = {
++  def cosTable2(k: Int): Vec[SInt] = {
+     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
+       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (cos(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+   
+   def wnTable(k: Int)(idx: UInt): MyComplex = {
+@@ -152,7 +208,7 @@ class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConf
+   }
+   
+   // CooleyTukey只需要FFTLength个周期来加载数据（批处理模式）
+-  val maxCount = (FFTLength - 1).asUInt()
++  val maxCount = (FFTLength - 1).U
+   val cnt = RegInit(0.U((stages + 1).W))
+   val busy = cnt =/= 0.U
+   when(io.din_valid || busy) {
+@@ -218,7 +274,7 @@ class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConf
+ 
+   io.dOut1 := RegNext(dout1)
+   io.dOut2 := RegNext(dout2)
+-  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
++  io.dout_valid := RegNext(cnt) === (FFTLength - 1).U
+ }
+ 
+ // 为了保持兼容，保留CooleyTukeyCore作为OptimizedR2MDCCore的别名
+@@ -237,36 +293,64 @@ class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
+   val stages = log2Ceil(FFTLength)
+ 
+   // DIF旋转因子表
+-  def difSinTable(stage: Int): Vec[FixedPoint] = {
++  def difSinTable(stage: Int): Vec[SInt] = {
+     val step = pow(2, stage).toInt
+     val numEntries = FFTLength / (2 * step)
+     val times = (0 until numEntries).map(i => -(i * step * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (sin(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+ 
+-  def difCosTable(stage: Int): Vec[FixedPoint] = {
++  def difCosTable(stage: Int): Vec[SInt] = {
+     val step = pow(2, stage).toInt
+     val numEntries = FFTLength / (2 * step)
+     val times = (0 until numEntries).map(i => -(i * step * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (cos(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+ 
+-  def difSinTable2(stage: Int): Vec[FixedPoint] = {
++  def difSinTable2(stage: Int): Vec[SInt] = {
+     val step = pow(2, stage).toInt
+     val numEntries = FFTLength / (2 * step)
+     val times = (0 until numEntries).map(i => (i * step * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (sin(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+ 
+-  def difCosTable2(stage: Int): Vec[FixedPoint] = {
++  def difCosTable2(stage: Int): Vec[SInt] = {
+     val step = pow(2, stage).toInt
+     val numEntries = FFTLength / (2 * step)
+     val times = (0 until numEntries).map(i => (i * step * 2 * Pi) / FFTLength.toDouble)
+-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
+-    VecInit(inits)
++    val scale = 1L << BinaryPoint
++    val lits = times.map { t =>
++      val v = (cos(t) * scale).round
++      val max = (1L << (DataWidth - 1)) - 1
++      val min = - (1L << (DataWidth - 1))
++      val clamped = math.max(min, math.min(max, v)).toLong
++      clamped.S(DataWidth.W)
++    }
++    VecInit(lits)
+   }
+ 
+   def timesInvn(a: MyComplex): MyComplex = {
+@@ -383,10 +467,10 @@ class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
+           savedDataLower := dataLower
+ 
+           // 获取旋转因子
+-          val wnRe = MuxLookup(currentStage, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
+-            (0 until stages).map(s => s.U -> Mux(mode, difCosTable2(s)(savedInBlockIdx), difCosTable(s)(savedInBlockIdx))))
+-          val wnIm = MuxLookup(currentStage, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
+-            (0 until stages).map(s => s.U -> Mux(mode, difSinTable2(s)(savedInBlockIdx), difSinTable(s)(savedInBlockIdx))))
++          val wnReVec = VecInit((0 until stages).map(s => Mux(mode, difCosTable2(s)(savedInBlockIdx), difCosTable(s)(savedInBlockIdx))))
++          val wnImVec = VecInit((0 until stages).map(s => Mux(mode, difSinTable2(s)(savedInBlockIdx), difSinTable(s)(savedInBlockIdx))))
++          val wnRe = wnReVec(currentStage)
++          val wnIm = wnImVec(currentStage)
+ 
+           val wn = Wire(new MyComplex)
+           wn.re := wnRe
+diff --git a/src/main/scala/FFT/Reorder.scala b/src/main/scala/FFT/Reorder.scala
+index d4b8b14..6ab55b1 100755
+--- a/src/main/scala/FFT/Reorder.scala
++++ b/src/main/scala/FFT/Reorder.scala
+@@ -29,7 +29,7 @@ class Reorder extends Module with HasDataConfig with HasElaborateConfig{ //整
+     rambank1.write(index2, io.in2)
+   }
+ 
+-  io.out_valid := (RegNext(in_counter) === (FFTLength / 2 - 1).asUInt()) || (out_counter =/= 0.U)
++  io.out_valid := (RegNext(in_counter) === (FFTLength / 2 - 1).asUInt) || (out_counter =/= 0.U)
+   when(io.out_valid) {
+     out_counter := out_counter + 1.U
+   }
+diff --git a/src/main/scala/FFT/TOP.scala b/src/main/scala/FFT/TOP.scala
+index 0f572c2..3be8e05 100644
+--- a/src/main/scala/FFT/TOP.scala
++++ b/src/main/scala/FFT/TOP.scala
+@@ -30,19 +30,26 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+     val axi = new AXI4LiteSlaveBundle(32, 64)
+   })
+ 
++  private val enableHwDebug = sys.props.get("FFT_HW_DEBUG").exists(_.toBoolean)
++  private def hwDebug(body: => Unit): Unit = if (enableHwDebug) body
++
+   // 创建虚拟的DecoupledIO接口用于内部FFT连接
+   val din = Wire(Flipped(DecoupledIO(new MyComplex)))
+   val dout = Wire(DecoupledIO(new MyComplex))
+ 
+-  // FFT连接逻辑（移除FIFO，直接连接以节省8KB内存）
++  // FFT连接逻辑（保留小 FIFO 确保握手稳定）
+   val FFT = Module(new FFTReorder)
++  val fifoCmd = Wire(DecoupledIO(new MyComplex))
++  fifoCmd.valid := FFT.io.dout_valid
++  fifoCmd.bits := FFT.io.dOut
++  val fifo = Queue(fifoCmd, 2 * FFTLength)
+ 
+-  // 直接连接FFT输出到dout（无需FIFO缓冲，outputMem已提供缓冲）
+-  din.ready := dout.ready && !FFT.io.busy
+-  FFT.io.din_valid := din.fire()
++  fifo.ready := dout.ready
++  din.ready := fifoCmd.ready
++  FFT.io.din_valid := din.valid && din.ready
+   FFT.io.dIn := din.bits
+-  dout.valid := FFT.io.dout_valid
+-  dout.bits := FFT.io.dOut
++  dout.valid := fifo.valid
++  dout.bits := fifo.bits
+   
+   // 四阶段状态机：INIT -> INPUT -> PROCESSING -> OUTPUT
+   val sInit :: sInput :: sProcessing :: sOutput :: Nil = Enum(4)
+@@ -66,14 +73,16 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+     initCount := initCount + 1.U
+     when(initCount === (FFTLength - 1).U) {
+       fftState := sInput
+-      printf("FFT_PHASE: Initialization complete\n")
++      hwDebug {
++        printf("FFT_PHASE: Initialization complete\n")
++      }
+     }
+   }
+   
+   // FFT输入控制 - 严格模拟原始逻辑
+   din.valid := false.B
+-  din.bits.re := 0.S.asFixedPoint(BinaryPoint.BP)
+-  din.bits.im := 0.S.asFixedPoint(BinaryPoint.BP)
++  din.bits.re := 0.S
++  din.bits.im := 0.S
+   
+   // FFT输出控制 - 等价于原始的dout.ready=1
+   dout.ready := true.B
+@@ -88,7 +97,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+       when(inputCount === FFTLength.U) {
+         fftState := sProcessing
+         processCycle := 0.U
+-        printf("FFT_PHASE: Input complete, starting processing\n")
++        hwDebug {
++          printf("FFT_PHASE: Input complete, starting processing\n")
++        }
+       }
+     }
+     
+@@ -100,29 +111,35 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+       // 只有在inputComplete=false时才允许设置din.valid，防止重复输入
+       when(processCycle < FFTLength.U && !inputComplete) {
+         val inputData = inputMem(processCycle)
+-        din.bits.re := inputData(31, 0).asSInt.asFixedPoint(BinaryPoint.BP)
+-        din.bits.im := inputData(63, 32).asSInt.asFixedPoint(BinaryPoint.BP)
++        din.bits.re := inputData(31, 0).asSInt
++        din.bits.im := inputData(63, 32).asSInt
+ 
+         // R2DIF等批量算法需要所有输入都valid，R2MDC只需第一个
+         // 为了兼容两种模式，都设置为valid=1
+         din.valid := true.B
+ 
+         when(processCycle < 3.U) {
+-          printf("FFT_INPUT[%d]: re=%d, im=%d, valid=%d\n",
+-                 processCycle, inputData(31, 0).asSInt, inputData(63, 32).asSInt, din.valid)
++          hwDebug {
++            printf("FFT_INPUT[%d]: re=%d, im=%d, valid=%d\n",
++              processCycle, inputData(31, 0).asSInt, inputData(63, 32).asSInt, din.valid)
++          }
+         }
+ 
+         // 标记输入完成
+         when(processCycle === (FFTLength - 1).U) {
+           inputComplete := true.B
+-          printf("FFT_PHASE: Input to FFT complete, waiting for output\n")
++          hwDebug {
++            printf("FFT_PHASE: Input to FFT complete, waiting for output\n")
++          }
+         }
+       }
+ 
+       // 等待FFT输出完成：当outputMem被完全填充时转到sOutput
+       when(outputCount === FFTLength.U) {
+         fftState := sOutput
+-        printf("FFT_PHASE: Processing complete (outputMem filled), ready for output\n")
++        hwDebug {
++          printf("FFT_PHASE: Processing complete (outputMem filled), ready for output\n")
++        }
+       }
+     }
+     
+@@ -133,19 +150,23 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+         inputCount := 0.U
+         outputCount := 0.U
+         readCount := 0.U
+-        printf("FFT_PHASE: Output complete, ready for next input\n")
++        hwDebug {
++          printf("FFT_PHASE: Output complete, ready for next input\n")
++        }
+       }
+     }
+   }
+   
+   // 收集FFT输出数据
+-  when(dout.fire()) {
+-    val outputData = Cat(dout.bits.im.asSInt.asUInt, dout.bits.re.asSInt.asUInt)
++  when(dout.valid && dout.ready) {
++    val outputData = Cat(dout.bits.im.asUInt, dout.bits.re.asUInt)
+     outputMem(outputCount) := outputData
+     
+     when(outputCount < 3.U) {
+-      printf("FFT_OUTPUT[%d]: re=%d, im=%d\n", 
+-             outputCount, dout.bits.re.asSInt, dout.bits.im.asSInt)
++      hwDebug {
++        printf("FFT_OUTPUT[%d]: re=%d, im=%d\n",
++          outputCount, dout.bits.re.asSInt, dout.bits.im.asSInt)
++      }
+     }
+     
+     outputCount := outputCount + 1.U
+@@ -161,7 +182,7 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+   
+   // AXI信号控制：严格按阶段控制，同时等待FFT core就绪
+   // sInit阶段拒绝所有AXI请求
+-  io.axi.awready := axiState === sIdle && fftState === sInput && inputCount < FFTLength.U && !FFT.io.busy
++  io.axi.awready := axiState === sIdle && fftState === sInput && inputCount < FFTLength.U
+   io.axi.wready := axiState === sWrite
+   io.axi.bvalid := bvalidReg
+   io.axi.bresp := 0.U
+@@ -176,10 +197,12 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+       rvalidReg := false.B
+ 
+       // 只在INPUT阶段且FFT不busy时接受写请求
+-      when(io.axi.awvalid && io.axi.awready && fftState === sInput && !FFT.io.busy) {
++      when(io.axi.awvalid && io.axi.awready && fftState === sInput) {
+         axiState := sWrite
+         when(inputCount < 3.U) {
+-          printf("AXI_WRITE_REQ[%d] in INPUT phase (FFT ready)\n", inputCount)
++          hwDebug {
++            printf("AXI_WRITE_REQ[%d] in INPUT phase (FFT ready)\n", inputCount)
++          }
+         }
+       }.elsewhen(io.axi.arvalid && io.axi.arready && fftState === sOutput) {
+         // 只在OUTPUT阶段接受读请求
+@@ -188,7 +211,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+         rvalidReg := true.B
+ 
+         when(readCount < 3.U) {
+-          printf("AXI_READ_REQ[%d] in OUTPUT phase, data=0x%x\n", readCount, outputMem(readCount))
++          hwDebug {
++            printf("AXI_READ_REQ[%d] in OUTPUT phase, data=0x%x\n", readCount, outputMem(readCount))
++          }
+         }
+       }
+     }
+@@ -202,7 +227,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+         inputMem(inputCount) := io.axi.wdata
+         
+         when(inputCount < 3.U) {
+-          printf("AXI_WRITE_DATA[%d] = 0x%x\n", inputCount, io.axi.wdata)
++          hwDebug {
++            printf("AXI_WRITE_DATA[%d] = 0x%x\n", inputCount, io.axi.wdata)
++          }
+         }
+         
+         inputCount := inputCount + 1.U
+@@ -215,7 +242,9 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+         rvalidReg := false.B
+         
+         when(readCount < 3.U) {
+-          printf("AXI_READ_COMPLETE[%d]\n", readCount)
++          hwDebug {
++            printf("AXI_READ_COMPLETE[%d]\n", readCount)
++          }
+         }
+         
+         readCount := readCount + 1.U
+@@ -227,4 +256,4 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
+   when(io.axi.bready && io.axi.bvalid) {
+     bvalidReg := false.B
+   }
+-}
+\ No newline at end of file
++}

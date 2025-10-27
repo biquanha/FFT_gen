@@ -23,32 +23,60 @@ class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
   val mode = io.mode.getOrElse(false.B)
   val stages = log2Ceil(FFTLength)
   
-  def sinTable(k: Int): Vec[FixedPoint] = {
+  def sinTable(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (sin(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
-  def cosTable(k: Int): Vec[FixedPoint] = {
+  def cosTable(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (cos(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
-  def sinTable2(k: Int): Vec[FixedPoint] = {
+  def sinTable2(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (sin(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
-  def cosTable2(k: Int): Vec[FixedPoint] = {
+  def cosTable2(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (cos(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
   def wnTable(k: Int)(idx: UInt): MyComplex = {
@@ -66,7 +94,7 @@ class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
   }
   
   // R2MDC需要额外的流水线延迟：FFTLength * 3/2 - 1个周期
-  val maxCount = (FFTLength * 3 / 2 - 1).asUInt()
+  val maxCount = (FFTLength * 3 / 2 - 1).U
   val cnt = RegInit(0.U((stages + 1).W))
   val busy = cnt =/= 0.U
   when(io.din_valid || busy){
@@ -97,7 +125,7 @@ class R2MDCCore extends Module with HasDataConfig with HasElaborateConfig {
   
   io.dOut1 := RegNext(dout1)
   io.dOut2 := RegNext(dout2)
-  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
+  io.dout_valid := RegNext(cnt) === (FFTLength - 1).U
 }
 
 // 优化的R2MDC算法核心模块 (之前错误地命名为CooleyTukey)
@@ -109,32 +137,60 @@ class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConf
   
   
   // 修改旋转因子计算，确保正确的索引和值
-  def sinTable(k: Int): Vec[FixedPoint] = {
+  def sinTable(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (sin(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
-  def cosTable(k: Int): Vec[FixedPoint] = {
+  def cosTable(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => -(i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (cos(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
-  def sinTable2(k: Int): Vec[FixedPoint] = {
+  def sinTable2(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (sin(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
-  def cosTable2(k: Int): Vec[FixedPoint] = {
+  def cosTable2(k: Int): Vec[SInt] = {
     val times = (0 until FFTLength / 2 by pow(2, k).toInt)
       .map(i => (i * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (cos(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
   
   def wnTable(k: Int)(idx: UInt): MyComplex = {
@@ -152,7 +208,7 @@ class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConf
   }
   
   // CooleyTukey只需要FFTLength个周期来加载数据（批处理模式）
-  val maxCount = (FFTLength - 1).asUInt()
+  val maxCount = (FFTLength - 1).U
   val cnt = RegInit(0.U((stages + 1).W))
   val busy = cnt =/= 0.U
   when(io.din_valid || busy) {
@@ -218,7 +274,7 @@ class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConf
 
   io.dOut1 := RegNext(dout1)
   io.dOut2 := RegNext(dout2)
-  io.dout_valid := RegNext(cnt) === (FFTLength - 1).asUInt()
+  io.dout_valid := RegNext(cnt) === (FFTLength - 1).U
 }
 
 // 为了保持兼容，保留CooleyTukeyCore作为OptimizedR2MDCCore的别名
@@ -237,36 +293,64 @@ class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
   val stages = log2Ceil(FFTLength)
 
   // DIF旋转因子表
-  def difSinTable(stage: Int): Vec[FixedPoint] = {
+  def difSinTable(stage: Int): Vec[SInt] = {
     val step = pow(2, stage).toInt
     val numEntries = FFTLength / (2 * step)
     val times = (0 until numEntries).map(i => -(i * step * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (sin(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
 
-  def difCosTable(stage: Int): Vec[FixedPoint] = {
+  def difCosTable(stage: Int): Vec[SInt] = {
     val step = pow(2, stage).toInt
     val numEntries = FFTLength / (2 * step)
     val times = (0 until numEntries).map(i => -(i * step * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (cos(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
 
-  def difSinTable2(stage: Int): Vec[FixedPoint] = {
+  def difSinTable2(stage: Int): Vec[SInt] = {
     val step = pow(2, stage).toInt
     val numEntries = FFTLength / (2 * step)
     val times = (0 until numEntries).map(i => (i * step * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(sin(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (sin(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
 
-  def difCosTable2(stage: Int): Vec[FixedPoint] = {
+  def difCosTable2(stage: Int): Vec[SInt] = {
     val step = pow(2, stage).toInt
     val numEntries = FFTLength / (2 * step)
     val times = (0 until numEntries).map(i => (i * step * 2 * Pi) / FFTLength.toDouble)
-    val inits = times.map(t => FixedPoint.fromDouble(cos(t), DataWidth.W, BinaryPoint.BP))
-    VecInit(inits)
+    val scale = 1L << BinaryPoint
+    val lits = times.map { t =>
+      val v = (cos(t) * scale).round
+      val max = (1L << (DataWidth - 1)) - 1
+      val min = - (1L << (DataWidth - 1))
+      val clamped = math.max(min, math.min(max, v)).toLong
+      clamped.S(DataWidth.W)
+    }
+    VecInit(lits)
   }
 
   def timesInvn(a: MyComplex): MyComplex = {
@@ -383,10 +467,10 @@ class R2DIFCore extends Module with HasDataConfig with HasElaborateConfig {
           savedDataLower := dataLower
 
           // 获取旋转因子
-          val wnRe = MuxLookup(currentStage, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
-            (0 until stages).map(s => s.U -> Mux(mode, difCosTable2(s)(savedInBlockIdx), difCosTable(s)(savedInBlockIdx))))
-          val wnIm = MuxLookup(currentStage, 0.S(32.W).asFixedPoint(BinaryPoint.BP),
-            (0 until stages).map(s => s.U -> Mux(mode, difSinTable2(s)(savedInBlockIdx), difSinTable(s)(savedInBlockIdx))))
+          val wnReVec = VecInit((0 until stages).map(s => Mux(mode, difCosTable2(s)(savedInBlockIdx), difCosTable(s)(savedInBlockIdx))))
+          val wnImVec = VecInit((0 until stages).map(s => Mux(mode, difSinTable2(s)(savedInBlockIdx), difSinTable(s)(savedInBlockIdx))))
+          val wnRe = wnReVec(currentStage)
+          val wnIm = wnImVec(currentStage)
 
           val wn = Wire(new MyComplex)
           wn.re := wnRe

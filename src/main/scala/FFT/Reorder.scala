@@ -29,7 +29,7 @@ class Reorder extends Module with HasDataConfig with HasElaborateConfig{ //Êï¥Áê
     rambank1.write(index2, io.in2)
   }
 
-  io.out_valid := (RegNext(in_counter) === (FFTLength / 2 - 1).asUInt()) || (out_counter =/= 0.U)
+  io.out_valid := (RegNext(in_counter) === (FFTLength / 2 - 1).asUInt) || (out_counter =/= 0.U)
   when(io.out_valid) {
     out_counter := out_counter + 1.U
   }
