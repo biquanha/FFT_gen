@@ -257,3 +257,6 @@ class TOP extends Module with HasDataConfig with HasElaborateConfig {
     bvalidReg := false.B
   }
 }
+
+// Verilator会保留TOP作为内部名称，测试时使用此别名避免冲突
+class FFTTop extends TOP

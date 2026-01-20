@@ -41,6 +41,37 @@ class Reorder extends Module with HasDataConfig with HasElaborateConfig{ //Êï¥Áê
   }
 }
 
+class ReorderSingle extends Module with HasDataConfig with HasElaborateConfig {
+  val io = IO(new Bundle{
+    val in = Input(new MyComplex)
+    val in_valid = Input(Bool())
+    val out = Output(new MyComplex)
+    val out_valid = Output(Bool())
+  })
+
+  val ram = Mem(FFTLength, new MyComplex)
+  val width = log2Ceil(FFTLength)
+  val inCounter = RegInit(0.U((width - 1).W))
+  val inNextBit = RegInit(0.U(1.W))
+  val outCounter = RegInit(0.U(width.W))
+  val index0 = Reverse(inCounter)
+  val index1 = Reverse(inCounter) + (FFTLength / 2).U
+
+  when(io.in_valid || (inCounter =/= 0.U || inNextBit =/= 0.U)) {
+    ram.write(Mux(inNextBit === 0.U, index1, index0), io.in)
+    inCounter := inCounter + 1.U
+    when(inCounter === (FFTLength / 2 - 1).U) {
+      inNextBit := inNextBit + 1.U
+    }
+  }
+
+  io.out_valid := (RegNext(Cat(inNextBit, inCounter)) === (FFTLength - 1).U) || (outCounter =/= 0.U)
+  when(io.out_valid) {
+    outCounter := outCounter + 1.U
+  }
+  io.out := ram.read(outCounter)
+}
+
 class FFTReorder extends Module
   with HasDataConfig
   with HasElaborateConfig {
@@ -57,12 +88,19 @@ class FFTReorder extends Module
   fftblock.io.dIn := io.dIn
   fftblock.io.din_valid := io.din_valid
 
-  val reorderblock = Module(new Reorder)
-  reorderblock.io.in1 := fftblock.io.dOut1
-  reorderblock.io.in2 := fftblock.io.dOut2
-  reorderblock.io.in_valid := fftblock.io.dout_valid
-
-  io.dOut := reorderblock.io.out
-  io.dout_valid := reorderblock.io.out_valid
+  if (fftAlgorithm == FFTAlgorithm.R2CSS) {
+    val reorderSingle = Module(new ReorderSingle)
+    reorderSingle.io.in := fftblock.io.dOut1
+    reorderSingle.io.in_valid := fftblock.io.dout_valid
+    io.dOut := reorderSingle.io.out
+    io.dout_valid := reorderSingle.io.out_valid
+  } else {
+    val reorderblock = Module(new Reorder)
+    reorderblock.io.in1 := fftblock.io.dOut1
+    reorderblock.io.in2 := fftblock.io.dOut2
+    reorderblock.io.in_valid := fftblock.io.dout_valid
+    io.dOut := reorderblock.io.out
+    io.dout_valid := reorderblock.io.out_valid
+  }
   io.busy := fftblock.io.busy
 }

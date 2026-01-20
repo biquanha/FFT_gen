@@ -13,11 +13,11 @@ class FFTTest4Spec extends AnyFlatSpec with ChiselScalatestTester {
   behavior of "TOP TEST4 (Chisel 6 + chiseltest)"
 
   it should "export data and complete without overflow" in {
-    test(new TOP).withAnnotations(Seq(VerilatorBackendAnnotation)) { c =>
+    test(new FFTTop).withAnnotations(Seq(VerilatorBackendAnnotation)) { c =>
       // 放宽/关闭 chiseltest 的默认超时限制
       c.clock.setTimeout(0)
       // 固定配置（与 Config.scala 中一致）
-      val FFTLength = 512
+      val FFTLength = sys.props.getOrElse("FFT_LEN", "512").toInt
       val BinaryPoint = 30
       val INPUT_ADDR = 0x0000
       val OUTPUT_ADDR = 0x1000

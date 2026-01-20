@@ -280,9 +280,8 @@ class OptimizedR2MDCCore extends Module with HasDataConfig with HasElaborateConf
 // 为了保持兼容，保留CooleyTukeyCore作为OptimizedR2MDCCore的别名
 class CooleyTukeyCore extends OptimizedR2MDCCore
 
-// R2CSS算法核心模块 - Radix-2 Single-path Delay Feedback (R2SDF)
-// 为了与批处理测试框架兼容，本实现采用与R2MDC相同的算法核心
-class R2CSSCore extends R2MDCCore
+// R2CSS算法核心模块 - Radix-2 Combined SDC-SDF
+// 实现见 R2CSS.scala
 
 // R2DIF算法核心模块 - Radix-2 Decimation-In-Frequency
 // 使用SyncReadMem确保BRAM推断，简单批处理架构
